@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .canvas import CanvasClient
-from .exceptions import AssignmentError, RubricError, SubmissionError
+from .exceptions import AssignmentNotFoundError, RubricError, SubmissionNotFoundError
 from .textutil import html_to_text, word_count
 
 
@@ -89,7 +89,7 @@ class AIGrader:
         # 1) Assignment
         assignment = self.canvas_client.get_assignment(course_id, assignment_id)
         if not assignment or not assignment.get("id"):
-            raise AssignmentError("Assignment not found or not accessible via API.")
+            raise AssignmentNotFoundError("Assignment not found or not accessible via API.")
 
         assignment_name = str(assignment.get("name") or f"Assignment {assignment_id}")
 

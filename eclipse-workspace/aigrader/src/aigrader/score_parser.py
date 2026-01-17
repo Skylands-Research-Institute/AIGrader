@@ -19,7 +19,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping
 
-from .exceptions import ParseError, RubricError
+from .exceptions import JSONParseError, RubricNotFoundError
 from .grader import GradeRun, RubricCriterion
 
 
@@ -63,7 +63,7 @@ def parse_and_validate(model_text: str, run: GradeRun) -> AssessmentResult:
       RubricError - rubric snapshot invalid / empty
     """
     if not run or not run.rubric or not run.rubric.criteria:
-        raise RubricError("Cannot validate: rubric snapshot is missing or empty.")
+        raise RubricNotFoundError("Cannot validate: rubric snapshot is missing or empty.")
 
     obj = _parse_json_strict(model_text)
     _validate_top_level(obj)
@@ -83,7 +83,7 @@ def parse_and_validate(model_text: str, run: GradeRun) -> AssessmentResult:
 
         comment = _as_string(item["comment"], f"criteria.{cid}.comment").strip()
         if not comment:
-            raise ParseError(f"criteria.{cid}.comment must be a non-empty string.")
+            raise JSONParseError(f"criteria.{cid}.comment must be a non-empty string.")
 
         criteria_assessments[cid] = CriterionAssessment(score=float(score), comment=comment)
         score_sum += float(score)
@@ -91,7 +91,7 @@ def parse_and_validate(model_text: str, run: GradeRun) -> AssessmentResult:
     overall_score = _as_number(obj["overall_score"], "overall_score")
     overall_comment = _as_string(obj["overall_comment"], "overall_comment").strip()
     if not overall_comment:
-        raise ParseError("overall_comment must be a non-empty string.")
+        raise JSONParseError("overall_comment must be a non-empty string.")
 
     _validate_overall_score(overall_score, score_sum)
 
@@ -108,7 +108,7 @@ def parse_and_validate(model_text: str, run: GradeRun) -> AssessmentResult:
 
 def _parse_json_strict(model_text: str) -> Dict[str, Any]:
     if not isinstance(model_text, str) or not model_text.strip():
-        raise ParseError("Model output was empty or not a string.")
+        raise JSONParseError("Model output was empty or not a string.")
 
     # Enforce: model must return ONLY JSON (no markdown).
     s = model_text.strip()
@@ -118,10 +118,10 @@ def _parse_json_strict(model_text: str) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         # Provide a helpful snippet
         snippet = s[:400].replace("\n", "\\n")
-        raise ParseError(f"Invalid JSON from model: {e.msg} (pos {e.pos}). Snippet: {snippet}") from e
+        raise JSONParseError(f"Invalid JSON from model: {e.msg} (pos {e.pos}). Snippet: {snippet}") from e
 
     if not isinstance(parsed, dict):
-        raise ParseError("Top-level JSON must be an object (dictionary).")
+        raise JSONParseError("Top-level JSON must be an object (dictionary).")
 
     return parsed
 
@@ -134,12 +134,12 @@ def _validate_top_level(obj: Mapping[str, Any]) -> None:
     extra = keys - required
 
     if missing:
-        raise ParseError(f"Missing top-level key(s): {sorted(missing)}")
+        raise JSONParseError(f"Missing top-level key(s): {sorted(missing)}")
     if extra:
-        raise ParseError(f"Unexpected top-level key(s): {sorted(extra)}")
+        raise JSONParseError(f"Unexpected top-level key(s): {sorted(extra)}")
 
     if not isinstance(obj["criteria"], dict):
-        raise ParseError("criteria must be an object mapping criterion_id -> {score, comment}.")
+        raise JSONParseError("criteria must be an object mapping criterion_id -> {score, comment}.")
 
 
 def _rubric_criteria_map(criteria: list[RubricCriterion]) -> Dict[str, float]:
@@ -162,14 +162,14 @@ def _validate_criteria_keys(criteria_obj: Mapping[str, Any], rubric_map: Dict[st
     extra = got - expected
 
     if missing:
-        raise ParseError(f"criteria is missing rubric criterion id(s): {sorted(missing)}")
+        raise JSONParseError(f"criteria is missing rubric criterion id(s): {sorted(missing)}")
     if extra:
-        raise ParseError(f"criteria contains unexpected criterion id(s): {sorted(extra)}")
+        raise JSONParseError(f"criteria contains unexpected criterion id(s): {sorted(extra)}")
 
 
 def _validate_criterion_item(cid: str, item: Any) -> None:
     if not isinstance(item, dict):
-        raise ParseError(f"criteria.{cid} must be an object with keys {{score, comment}}.")
+        raise JSONParseError(f"criteria.{cid} must be an object with keys {{score, comment}}.")
 
     required = {"score", "comment"}
     keys = set(item.keys())
@@ -178,9 +178,9 @@ def _validate_criterion_item(cid: str, item: Any) -> None:
     extra = keys - required
 
     if missing:
-        raise ParseError(f"criteria.{cid} missing key(s): {sorted(missing)}")
+        raise JSONParseError(f"criteria.{cid} missing key(s): {sorted(missing)}")
     if extra:
-        raise ParseError(f"criteria.{cid} has unexpected key(s): {sorted(extra)}")
+        raise JSONParseError(f"criteria.{cid} has unexpected key(s): {sorted(extra)}")
 
 
 # -----------------------------
@@ -189,32 +189,32 @@ def _validate_criterion_item(cid: str, item: Any) -> None:
 
 def _as_string(val: Any, path: str) -> str:
     if not isinstance(val, str):
-        raise ParseError(f"{path} must be a string.")
+        raise JSONParseError(f"{path} must be a string.")
     return val
 
 
 def _as_number(val: Any, path: str) -> float:
     # Allow int/float (and numeric strings only if you want; for now: strict numeric types)
     if isinstance(val, bool):
-        raise ParseError(f"{path} must be a number, not boolean.")
+        raise JSONParseError(f"{path} must be a number, not boolean.")
     if isinstance(val, (int, float)):
         if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-            raise ParseError(f"{path} must be a finite number.")
+            raise JSONParseError(f"{path} must be a finite number.")
         return float(val)
-    raise ParseError(f"{path} must be a number.")
+    raise JSONParseError(f"{path} must be a number.")
 
 
 def _validate_score_range(cid: str, score: float, max_points: float) -> None:
     if score < 0:
-        raise ParseError(f"criteria.{cid}.score must be >= 0.")
+        raise JSONParseError(f"criteria.{cid}.score must be >= 0.")
     # allow a tiny epsilon for float noise
     if score > max_points + 1e-9:
-        raise ParseError(f"criteria.{cid}.score exceeds max points ({max_points:g}).")
+        raise JSONParseError(f"criteria.{cid}.score exceeds max points ({max_points:g}).")
 
 
 def _validate_overall_score(overall_score: float, score_sum: float) -> None:
     # Use a small tolerance; overall_score should match sum exactly in practice.
     if abs(overall_score - score_sum) > 1e-6:
-        raise ParseError(
+        raise JSONParseError(
             f"overall_score ({overall_score:g}) does not equal sum of criterion scores ({score_sum:g})."
         )
