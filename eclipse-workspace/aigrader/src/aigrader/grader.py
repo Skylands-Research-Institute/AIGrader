@@ -35,6 +35,11 @@ def html_to_text(html: str) -> str:
 def word_count(text: str) -> int:
     return len(re.findall(r"\b\w+\b", text or ""))
 
+@dataclass(frozen=True)
+class SubmissionSnapshot:
+    user_id: int
+    word_count: int
+    text: str
 
 @dataclass(frozen=True)
 class PreflightSummary:
@@ -47,7 +52,12 @@ class PreflightSummary:
     submission_user_id: int
     submission_word_count: int
 
-
+@dataclass(frozen=True)
+class GradeRun:
+    preflight: PreflightSummary
+    submission_text: str
+    submission_word_count: int
+    
 class AIGrader:
     """
     Top-level orchestrator for AI-based grading.
@@ -59,13 +69,23 @@ class AIGrader:
         self.canvas_client = canvas_client
         self.llm_client = llm_client
         self.config = config
+        
+    def get_submission_text(self, course_id: int, assignment_id: int, user_id: int) -> SubmissionSnapshot:
+        sub = self.canvas_client.get_submission_text_entry(course_id, assignment_id, user_id)
+        body_html = (sub or {}).get("body") or ""
+        text = html_to_text(str(body_html))
+        return SubmissionSnapshot(
+            user_id=int(sub.get("user_id")),
+            word_count=word_count(text),
+            text=text,
+        ) 
 
     def grade_assignment(
         self,
         course_id: int,
         assignment_id: int,
         user_id: Optional[int] = None,
-    ) -> PreflightSummary:
+    ) -> GradeRun:
         """
         Phase 1: Preflight checks only (no OpenAI, no writeback).
 
@@ -122,8 +142,7 @@ class AIGrader:
         if isinstance(min_wc, int) and wc < min_wc:
             raise SubmissionError(f"Submission text too short ({wc} words < min_word_count {min_wc}).")
 
-        # Phase 1 output: summarized confirmation that everything is ready
-        return PreflightSummary(
+        preflight = PreflightSummary(
             course_id=course_id,
             assignment_id=assignment_id,
             assignment_name=assignment_name,
@@ -133,3 +152,13 @@ class AIGrader:
             submission_user_id=int(sub_user_id),
             submission_word_count=wc,
         )
+        
+        snapshot = self.get_submission_text(course_id, assignment_id, int(sub_user_id))
+
+        return GradeRun(
+            preflight=preflight,
+            submission_text=snapshot.text,
+            submission_word_count=snapshot.word_count
+        )
+
+
