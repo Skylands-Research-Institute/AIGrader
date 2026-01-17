@@ -1,0 +1,92 @@
+########################################
+# Eclipse / PyDev
+########################################
+
+.metadata/
+.recommenders/
+.settings/
+.project
+.pydevproject
+*.launch
+
+########################################
+# PyDev / Eclipse runtime files
+########################################
+
+.pydevd*
+*.log
+
+########################################
+# Python bytecode / cache
+########################################
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+########################################
+# Virtual environments
+########################################
+
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+.python-version
+
+########################################
+# Python packaging / build artifacts
+########################################
+
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+########################################
+# Testing / coverage
+########################################
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+########################################
+# Jupyter / IPython (if you ever experiment)
+########################################
+
+.ipynb_checkpoints/
+.profile_default/
+
+########################################
+# OS-specific
+########################################
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
+
+########################################
+# Secrets / local config
+########################################
+
+.env
+.env.*
+*.key
+*.secret
+secrets.json
+
+########################################
+# Editor swap / temp files
+########################################
+
+*~
+*.swp
+*.tmp
