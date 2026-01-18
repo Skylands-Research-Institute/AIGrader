@@ -143,7 +143,122 @@ class CanvasClient:
         return None
 
     # -----------------------------
-    # Posting / reading submissions
+    # Canvas Files -> prompt loading
+    # -----------------------------
+
+    def _find_course_folder_id_by_name(self, course_id: int, folder_name: str) -> int:
+        """
+        Find a course folder by name using the Canvas folders search_term filter.
+
+        Selection rule (to avoid surprises):
+          1) exact name match AND full_name endswith "/<folder_name>"
+          2) exact name match (if full_name missing)
+        Fail-fast if no matches.
+        """
+        folder_name = folder_name.strip()
+        if not folder_name:
+            raise ValueError("folder_name must be non-empty.")
+
+        # Canvas: GET /api/v1/courses/:course_id/folders?search_term=...
+        folders = self._get_paginated(
+            f"/api/v1/courses/{course_id}/folders",
+            params={"search_term": folder_name, "per_page": 100},
+        )
+
+        exact: List[Dict[str, Any]] = []
+        for f in folders:
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name")
+            if isinstance(name, str) and name.strip() == folder_name:
+                exact.append(f)
+
+        if not exact:
+            raise FileNotFoundError(f'Canvas folder not found by name search_term="{folder_name}".')
+
+        # Prefer full_name that ends with "/<folder_name>"
+        preferred: List[Dict[str, Any]] = []
+        suffix = "/" + folder_name
+        for f in exact:
+            full_name = f.get("full_name")
+            if isinstance(full_name, str) and full_name.endswith(suffix):
+                preferred.append(f)
+
+        chosen = None
+        if len(preferred) == 1:
+            chosen = preferred[0]
+        elif len(preferred) > 1:
+            # Multiple candidates; pick the shallowest (shortest full_name) to reduce ambiguity.
+            preferred.sort(key=lambda x: len(str(x.get("full_name") or "")))
+            chosen = preferred[0]
+        else:
+            # No full_name help; pick the first exact match.
+            chosen = exact[0]
+
+        fid = chosen.get("id")
+        if fid is None:
+            raise RuntimeError("Canvas folder search returned an item without an id.")
+        return int(fid)
+
+    def get_course_file_text(self, course_id: int, folder_path: str, filename: str) -> str:
+        """
+        Load a text file from Canvas course Files, by folder name + filename.
+
+        We treat folder_path as a *folder name* (not a full nested path),
+        because Canvas folder path resolution is brittle across instances.
+
+        Example:
+          get_course_file_text(course_id, "AIGrader", "initial_prompt.txt")
+
+        Fail-fast behavior:
+          - raises FileNotFoundError if folder or file does not exist
+          - raises RuntimeError if download fails or content is empty
+        """
+        folder_name = folder_path.strip().strip("/")
+        want = filename.strip()
+
+        if not folder_name:
+            raise ValueError("folder_path must be non-empty (e.g., 'AIGrader').")
+        if not want:
+            raise ValueError("filename must be non-empty (e.g., 'initial_prompt.txt').")
+
+        folder_id = self._find_course_folder_id_by_name(course_id, folder_name)
+
+        files = self._get_paginated(f"/api/v1/folders/{folder_id}/files", params={"per_page": 100})
+        match = None
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            fn = f.get("filename") or f.get("display_name") or ""
+            if isinstance(fn, str) and fn.strip() == want:
+                match = f
+                break
+
+        if match is None:
+            raise FileNotFoundError(f"Canvas file not found: {folder_name}/{want}")
+
+        download_url = match.get("url") or match.get("download_url")
+        if not isinstance(download_url, str) or not download_url.strip():
+            fid = match.get("id")
+            if fid is None:
+                raise RuntimeError("Canvas file metadata missing download URL and id.")
+            detail = self._request("GET", f"/api/v1/files/{fid}")
+            download_url = detail.get("url") or detail.get("download_url")
+
+        if not isinstance(download_url, str) or not download_url.strip():
+            raise RuntimeError("Canvas did not provide a downloadable URL for the file.")
+
+        resp = self.session.get(download_url, timeout=self.timeout_s, allow_redirects=True)
+        if resp.status_code >= 400:
+            raise CanvasAPIError("GET", download_url, resp.status_code, resp.text)
+
+        text = resp.text.replace("\r\n", "\n").strip()
+        if not text:
+            raise RuntimeError(f"Canvas file {folder_name}/{want} is empty.")
+        return text
+
+    # -----------------------------
+    # Submission comment posting
     # -----------------------------
 
     def add_submission_comment(
@@ -156,9 +271,6 @@ class CanvasClient:
         as_html: bool = False,
         attempt: int | None = None,
     ) -> Dict[str, Any]:
-        """
-        Comment only. Posts HTML fragments via comment[text_comment] (Canvas sanitizes).
-        """
         path = f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
 
         payload: Dict[str, Any] = {"comment[text_comment]": text_comment}
@@ -166,16 +278,6 @@ class CanvasClient:
             payload["comment[attempt]"] = int(attempt)
 
         return self._request("PUT", path, data=payload)
-
-    def get_submission_with_comments(self, course_id: int, assignment_id: int, user_id: int) -> Dict[str, Any]:
-        """
-        Fetch a submission including submission_comments + submission_history if available.
-        """
-        return self._request(
-            "GET",
-            f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
-            params={"include[]": ["submission_comments", "submission_history", "user"]},
-        )
 
     # -----------------------------
     # High-level API methods
@@ -230,7 +332,6 @@ class CanvasClient:
         return None
 
     def get_rubric_for_assignment(self, course_id: int, assignment_id: int) -> Optional[Dict[str, Any]]:
-        # A) rubric_associations (may 404)
         try:
             assocs = self._request(
                 "GET",
@@ -264,7 +365,6 @@ class CanvasClient:
             if e.status_code != 404:
                 raise
 
-        # B) assignment include
         a = self.get_assignment(course_id, assignment_id, include=["rubric", "rubric_settings", "rubric_association"])
         embedded = a.get("rubric")
 

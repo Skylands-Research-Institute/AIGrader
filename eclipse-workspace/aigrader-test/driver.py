@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -27,61 +26,8 @@ except Exception:
     LLMClient = None  # type: ignore
 
 
-FINGERPRINT_PREFIX = "aigrader_fingerprint:"
-
-
-def _sha256_text(s: str) -> str:
-    h = hashlib.sha256()
-    h.update(s.encode("utf-8"))
-    return h.hexdigest()
-
-
-def compute_submission_fingerprint(submission: dict) -> str:
-    """
-    Fingerprint changes if the student resubmits.
-    Use attempt if present; otherwise submitted_at/updated_at + body hash.
-    """
-    attempt = submission.get("attempt")
-    submitted_at = submission.get("submitted_at") or submission.get("posted_at") or ""
-    updated_at = submission.get("updated_at") or ""
-    body = submission.get("body") or ""
-    if not isinstance(body, str):
-        body = ""
-
-    body_hash = _sha256_text(body)
-
-    # attempt is the best discriminator; if missing, rely on timestamps + body hash
-    if attempt is None:
-        return f"attempt=?|submitted_at={submitted_at}|updated_at={updated_at}|body_sha256={body_hash}"
-    return f"attempt={attempt}|submitted_at={submitted_at}|updated_at={updated_at}|body_sha256={body_hash}"
-
-
-def comment_contains_fingerprint(comment_text: str, fp: str) -> bool:
-    if not comment_text:
-        return False
-    # We require the exact fingerprint line to match
-    return f"{FINGERPRINT_PREFIX} {fp}" in comment_text
-
-
-def already_assessed(submission_with_comments: dict, fp: str) -> bool:
-    comments = submission_with_comments.get("submission_comments") or []
-    if not isinstance(comments, list):
-        return False
-
-    for c in comments:
-        if not isinstance(c, dict):
-            continue
-        # Canvas typically returns "comment" as the text body
-        txt = c.get("comment") or ""
-        if not isinstance(txt, str):
-            continue
-        if comment_contains_fingerprint(txt, fp):
-            return True
-    return False
-
-
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AIGrader test driver (LLM + optional Canvas comment + idempotency).")
+    p = argparse.ArgumentParser(description="AIGrader test driver (system prompt from Canvas Files).")
 
     p.add_argument("--base-url", default=None)
     p.add_argument("--token", default=None)
@@ -126,21 +72,18 @@ def main() -> int:
     print("\n=== PREFLIGHT SUMMARY ===")
     print(run.preflight)
 
-    # --- Idempotency check (skip if same submission already assessed) ---
-    sub = client.get_submission_with_comments(
+    # -----------------------------
+    # FAIL-FAST: Load system prompt from Canvas Files
+    # -----------------------------
+    system_prompt = client.get_course_file_text(
         course_id=args.course_id,
-        assignment_id=args.assignment_id,
-        user_id=run.preflight.submission_user_id,
+        folder_path="AIGrader",
+        filename="initial_prompt.txt",
     )
-    fp = compute_submission_fingerprint(sub)
+    print("\nSystem prompt source: Canvas Files AIGrader/initial_prompt.txt")
 
-    if already_assessed(sub, fp):
-        print("\nSKIP: This submission already has an AIGrader assessment comment for the current attempt/body.")
-        print(f"{FINGERPRINT_PREFIX} {fp}")
-        return 0
-
-    # Build prompts
-    spec = build_prompts(run)
+    # Build prompts (system prompt is now REQUIRED)
+    spec = build_prompts(run, system_prompt=system_prompt)
 
     if args.print_prompts:
         print("\n=== SYSTEM PROMPT ===")
@@ -155,7 +98,7 @@ def main() -> int:
 
     meta = CommentMetadata(model=None, response_id=None)
 
-    # Get model output (real or mock)
+    # Get model output
     if args.use_llm:
         if LLMClient is None:
             raise RuntimeError("Could not import aigrader.llm.LLMClient.")
@@ -181,6 +124,7 @@ def main() -> int:
             print(f"Saved raw model output to: {args.save_raw}")
 
     else:
+        # Mock
         criteria_obj = {}
         total = 0.0
         for c in run.rubric.criteria:
@@ -200,11 +144,10 @@ def main() -> int:
     print(f"Overall score: {result.overall_score:g}")
     print(f"Overall comment: {result.overall_comment}")
 
-    # Post comment (with fingerprint stamp)
+    # Optional: post comment
     if args.post_comment:
         if args.comment_html:
             comment = render_ai_assessment_comment_html(run, result, meta=meta)
-            comment = comment + f"<p><em>{FINGERPRINT_PREFIX} {fp}</em></p>"
             client.add_submission_comment(
                 course_id=args.course_id,
                 assignment_id=args.assignment_id,
@@ -215,7 +158,6 @@ def main() -> int:
             print("\nPosted AI assessment as a Canvas HTML comment (Not Applied).")
         else:
             comment = render_ai_assessment_comment(run, result, meta=meta)
-            comment = comment + "\n\n" + f"{FINGERPRINT_PREFIX} {fp}"
             client.add_submission_comment(
                 course_id=args.course_id,
                 assignment_id=args.assignment_id,
@@ -226,7 +168,6 @@ def main() -> int:
             print("\nPosted AI assessment as a Canvas text comment (Not Applied).")
 
     print("\nOK: End-to-end prompt + validation pipeline succeeded.")
-    print(f"{FINGERPRINT_PREFIX} {fp}")
     return 0
 
 

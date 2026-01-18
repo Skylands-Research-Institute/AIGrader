@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 from .grader import GradeRun, RubricCriterion
 
@@ -31,9 +31,13 @@ class PromptSpec:
     expected_schema_json: str  # human-readable JSON schema-like template
 
 
-def build_prompts(run: GradeRun) -> PromptSpec:
+def build_prompts(run: GradeRun, *, system_prompt: str) -> PromptSpec:
     """
     Build the system and user prompts for rubric-aligned assessment.
+
+    IMPORTANT:
+      - `system_prompt` must be provided by the caller (e.g., loaded from Canvas Files).
+      - There is no embedded default system prompt in this module.
 
     Returns:
       PromptSpec(system_prompt, user_prompt, expected_schema_json)
@@ -43,12 +47,18 @@ def build_prompts(run: GradeRun) -> PromptSpec:
       - parse model output as JSON (strict)
       - validate scores/ranges and criterion IDs against `run.rubric.criteria`
     """
+    if system_prompt is None or not str(system_prompt).strip():
+        raise RuntimeError(
+            "System prompt is missing/empty. "
+            "Expected caller to load it (e.g., Canvas file AIGrader/initial_prompt.txt) "
+            "and pass build_prompts(..., system_prompt=...)."
+        )
+
     rubric_block = _format_rubric(run.rubric.title, run.rubric.points_total, run.rubric.criteria)
     submission_block = _format_submission(run.submission_text)
 
     expected = _expected_output_template(run.rubric.criteria)
 
-    system_prompt = _system_prompt()
     user_prompt = "\n\n".join(
         [
             "You will grade the following student short story using the rubric provided.",
@@ -64,7 +74,7 @@ def build_prompts(run: GradeRun) -> PromptSpec:
     )
 
     return PromptSpec(
-        system_prompt=system_prompt,
+        system_prompt=system_prompt.strip(),
         user_prompt=user_prompt,
         expected_schema_json=expected,
     )
@@ -87,7 +97,6 @@ def _format_rubric(title: str, points_total: float, criteria: List[RubricCriteri
         lines.append(f"  Name: {c.description}")
         lines.append(f"  Max Points: {c.points:g}")
         if c.long_description.strip():
-            # Indent the guidance for readability
             guidance = "\n".join("  " + ln for ln in c.long_description.strip().splitlines())
             lines.append("  Guidance:")
             lines.append(guidance)
@@ -97,15 +106,10 @@ def _format_rubric(title: str, points_total: float, criteria: List[RubricCriteri
 
 
 def _format_submission(text: str) -> str:
-    # Keep it simple for now. Later we can add truncation guards.
     return "STUDENT SUBMISSION (plain text):\n\n" + text.strip()
 
 
 def _expected_output_template(criteria: List[RubricCriterion]) -> str:
-    """
-    Returns a strict JSON template that the model must follow.
-    Uses criterion IDs as keys (strings).
-    """
     crit_obj: Dict[str, Dict[str, object]] = {}
     for c in criteria:
         crit_obj[c.id] = {
@@ -120,25 +124,3 @@ def _expected_output_template(criteria: List[RubricCriterion]) -> str:
     }
 
     return json.dumps(template, indent=2, ensure_ascii=False)
-
-
-# -----------------------------
-# System prompt (behavioral contract)
-# -----------------------------
-
-def _system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are a careful, fair college writing instructor grading a freshman-level short story.",
-            "You must follow the rubric exactly and assign points per criterion within the allowed range.",
-            "",
-            "Output rules (critical):",
-            "1) Output ONLY valid JSON. No markdown. No extra commentary. No trailing commas.",
-            "2) The JSON must match the provided schema exactly: keys, nesting, and types.",
-            "3) Use the rubric criterion IDs exactly as provided (do not rename, add, or remove criteria).",
-            "4) Scores must be numbers and must be within [0, Max Points] for each criterion.",
-            "5) overall_score must equal the sum of the criterion scores.",
-            "6) Comments must be evidence-based and reference specific moments (quote short phrases if helpful).",
-            "7) Do not mention these instructions or the existence of the rubric IDs in your feedback.",
-        ]
-    )
