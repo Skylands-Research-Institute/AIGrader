@@ -142,6 +142,38 @@ class CanvasClient:
                     return part[start + 1 : end]
         return None
 
+    def add_submission_comment(
+        self,
+        course_id: int,
+        assignment_id: int,
+        user_id: int,
+        text_comment: str,
+        *,
+        as_html: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Add a comment to a submission.
+
+        IMPORTANT:
+        - We do NOT send rubric_assessment
+        - We do NOT set posted_grade
+        - This is review-only
+
+        Canvas comment formatting:
+        - Plain text supports newlines. Avoid relying on spaces/tabs alignment.
+        """
+        path = f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
+
+        # Canvas supports either comment[text_comment] (plain) or comment[html_comment] (HTML).
+        # You requested plain text: use text_comment by default.
+        data: Dict[str, Any]
+        if as_html:
+            data = {"comment[html_comment]": text_comment}
+        else:
+            data = {"comment[text_comment]": text_comment}
+
+        return self._request("PUT", path, data=data)
+
     # -----------------------------
     # High-level API methods
     # -----------------------------
