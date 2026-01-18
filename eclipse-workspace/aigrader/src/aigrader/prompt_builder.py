@@ -20,10 +20,6 @@ from typing import Dict, List
 from .grader import GradeRun, RubricCriterion
 
 
-# -----------------------------
-# Output schema (for model + parser)
-# -----------------------------
-
 @dataclass(frozen=True)
 class PromptSpec:
     system_prompt: str
@@ -38,14 +34,6 @@ def build_prompts(run: GradeRun, *, system_prompt: str) -> PromptSpec:
     IMPORTANT:
       - `system_prompt` must be provided by the caller (e.g., loaded from Canvas Files).
       - There is no embedded default system prompt in this module.
-
-    Returns:
-      PromptSpec(system_prompt, user_prompt, expected_schema_json)
-
-    The grader should later:
-      - send system_prompt + user_prompt to the model
-      - parse model output as JSON (strict)
-      - validate scores/ranges and criterion IDs against `run.rubric.criteria`
     """
     if system_prompt is None or not str(system_prompt).strip():
         raise RuntimeError(
@@ -56,12 +44,25 @@ def build_prompts(run: GradeRun, *, system_prompt: str) -> PromptSpec:
 
     rubric_block = _format_rubric(run.rubric.title, run.rubric.points_total, run.rubric.criteria)
     submission_block = _format_submission(run.submission_text)
-
     expected = _expected_output_template(run.rubric.criteria)
+
+    # Try to include assignment name if present (keeps prompt generic but contextual).
+    assignment_name = ""
+    try:
+        # Some implementations store this on run.preflight; others might store on run itself.
+        assignment_name = getattr(getattr(run, "preflight", None), "assignment_name", "") or getattr(run, "assignment_name", "")
+    except Exception:
+        assignment_name = ""
+
+    header_lines: List[str] = []
+    header_lines.append("You will grade the following student submission using the rubric provided.")
+    if isinstance(assignment_name, str) and assignment_name.strip():
+        header_lines.append(f"ASSIGNMENT: {assignment_name.strip()}")
 
     user_prompt = "\n\n".join(
         [
-            "You will grade the following student short story using the rubric provided.",
+            "\n".join(header_lines),
+            # Keep this instruction here as a belt-and-suspenders, even if system prompt also says it.
             "Return ONLY a single JSON object that matches the required schema.",
             "",
             rubric_block,
@@ -79,10 +80,6 @@ def build_prompts(run: GradeRun, *, system_prompt: str) -> PromptSpec:
         expected_schema_json=expected,
     )
 
-
-# -----------------------------
-# Formatting helpers
-# -----------------------------
 
 def _format_rubric(title: str, points_total: float, criteria: List[RubricCriterion]) -> str:
     lines: List[str] = []
@@ -106,7 +103,7 @@ def _format_rubric(title: str, points_total: float, criteria: List[RubricCriteri
 
 
 def _format_submission(text: str) -> str:
-    return "STUDENT SUBMISSION (plain text):\n\n" + text.strip()
+    return "STUDENT SUBMISSION (plain text):\n\n" + (text or "").strip()
 
 
 def _expected_output_template(criteria: List[RubricCriterion]) -> str:
@@ -114,13 +111,13 @@ def _expected_output_template(criteria: List[RubricCriterion]) -> str:
     for c in criteria:
         crit_obj[c.id] = {
             "score": 0,
-            "comment": "Brief, specific feedback tied to evidence from the submission."
+            "comment": "Brief, specific feedback tied to evidence from the submission.",
         }
 
     template = {
         "overall_score": 0,
         "overall_comment": "2-6 sentences summarizing strengths + 1-2 prioritized next steps.",
-        "criteria": crit_obj
+        "criteria": crit_obj,
     }
 
     return json.dumps(template, indent=2, ensure_ascii=False)

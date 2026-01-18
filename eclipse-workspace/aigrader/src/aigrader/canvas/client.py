@@ -147,6 +147,14 @@ class CanvasClient:
     # -----------------------------
 
     def _find_course_folder_id_by_name(self, course_id: int, folder_name: str) -> int:
+        """
+        Find a course folder by name using the Canvas folders search_term filter.
+
+        Selection rule (to avoid surprises):
+          1) exact name match AND full_name endswith "/<folder_name>"
+          2) exact name match (if full_name missing)
+        Fail-fast if no matches.
+        """
         folder_name = folder_name.strip()
         if not folder_name:
             raise ValueError("folder_name must be non-empty.")
@@ -188,6 +196,19 @@ class CanvasClient:
         return int(fid)
 
     def get_course_file_text(self, course_id: int, folder_path: str, filename: str) -> str:
+        """
+        Load a text file from Canvas course Files, by folder name + filename.
+
+        We treat folder_path as a *folder name* (not a full nested path),
+        because Canvas folder path resolution is brittle across instances.
+
+        Example:
+          get_course_file_text(course_id, "AIGrader", "initial_prompt.txt")
+
+        Fail-fast behavior:
+          - raises FileNotFoundError if folder or file does not exist
+          - raises RuntimeError if download fails or content is empty
+        """
         folder_name = folder_path.strip().strip("/")
         want = filename.strip()
 
@@ -226,6 +247,10 @@ class CanvasClient:
         if resp.status_code >= 400:
             raise CanvasAPIError("GET", download_url, resp.status_code, resp.text)
 
+        # IMPORTANT: Canvas text file downloads sometimes get decoded with the wrong charset guess.
+        # Force UTF-8 to prevent mojibake like â â for smart quotes.
+        resp.encoding = "utf-8"
+
         text = resp.text.replace("\r\n", "\n").strip()
         if not text:
             raise RuntimeError(f"Canvas file {folder_name}/{want} is empty.")
@@ -244,6 +269,10 @@ class CanvasClient:
             f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
             params={"include[]": ["submission_comments", "submission_history", "user"]},
         )
+
+    # -----------------------------
+    # Submission comment posting
+    # -----------------------------
 
     def add_submission_comment(
         self,
