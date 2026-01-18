@@ -10,8 +10,8 @@ import requests
 
 @dataclass(frozen=True)
 class CanvasAuth:
-    base_url: str          # e.g. https://sussexccc.instructure.com
-    token: str             # Canvas access token
+    base_url: str
+    token: str
 
 
 class CanvasAPIError(RuntimeError):
@@ -24,14 +24,6 @@ class CanvasAPIError(RuntimeError):
 
 
 class CanvasClient:
-    """
-    Canvas API client used by AIGrader.
-    Focuses on:
-      - fetching assignment + rubric criteria
-      - fetching submission text entry
-      - posting a comment to the submission
-    """
-
     def __init__(
         self,
         auth: CanvasAuth,
@@ -71,10 +63,6 @@ class CanvasClient:
         data: Dict[str, Any] | None = None,
         json: Any | None = None,
     ) -> Any:
-        """
-        Basic request wrapper with retry for transient 5xx.
-        Returns parsed JSON (or None for empty body).
-        """
         url = self._url(path)
         last: Optional[CanvasAPIError] = None
 
@@ -105,9 +93,6 @@ class CanvasClient:
         raise CanvasAPIError(method, url, 599, "Unknown error after retries")
 
     def _get_paginated(self, path: str, *, params: Dict[str, Any] | None = None) -> List[Any]:
-        """
-        Fetch all pages for a Canvas list endpoint using the Link header.
-        """
         url = self._url(path)
         out: List[Any] = []
         p = dict(params or {})
@@ -140,7 +125,7 @@ class CanvasClient:
 
             link = resp.headers.get("Link", "")
             url = self._next_link(link)
-            p = {}  # next URL already contains query
+            p = {}
 
         return out
 
@@ -158,7 +143,7 @@ class CanvasClient:
         return None
 
     # -----------------------------
-    # Submission comment posting
+    # Posting / reading submissions
     # -----------------------------
 
     def add_submission_comment(
@@ -172,11 +157,7 @@ class CanvasClient:
         attempt: int | None = None,
     ) -> Dict[str, Any]:
         """
-        Add a comment to a submission.
-
-        Canvas’ documented field is comment[text_comment].
-        If you pass HTML here, Canvas may sanitize + render it.
-        We do NOT use comment[html_comment] (often ignored).
+        Comment only. Posts HTML fragments via comment[text_comment] (Canvas sanitizes).
         """
         path = f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
 
@@ -184,8 +165,17 @@ class CanvasClient:
         if attempt is not None:
             payload["comment[attempt]"] = int(attempt)
 
-        # No grade, no rubric assessment: comment only.
         return self._request("PUT", path, data=payload)
+
+    def get_submission_with_comments(self, course_id: int, assignment_id: int, user_id: int) -> Dict[str, Any]:
+        """
+        Fetch a submission including submission_comments + submission_history if available.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
+            params={"include[]": ["submission_comments", "submission_history", "user"]},
+        )
 
     # -----------------------------
     # High-level API methods
@@ -206,12 +196,6 @@ class CanvasClient:
 
     @staticmethod
     def _looks_like_criteria_list(x: Any) -> bool:
-        """
-        When you request include[]=rubric on an assignment, Canvas commonly returns:
-          assignment["rubric"] = [ {criterion}, {criterion}, ... ]
-        i.e., the rubric CRITERIA list (not a rubric object).
-        Criterion ids look like "_2630".
-        """
         if not isinstance(x, list) or not x:
             return False
         first = x[0]
@@ -220,9 +204,6 @@ class CanvasClient:
         return ("points" in first) and (("description" in first) or ("criterion_description" in first))
 
     def _fetch_rubric_by_id(self, course_id: int, rubric_id: Any) -> Optional[Dict[str, Any]]:
-        """
-        Try a few rubric endpoints; return dict if found.
-        """
         if rubric_id is None:
             return None
 
@@ -230,7 +211,6 @@ class CanvasClient:
         if rid.startswith("_"):
             rid = rid[1:]
 
-        # course-scoped
         try:
             full = self._request("GET", f"/api/v1/courses/{course_id}/rubrics/{rid}")
             if isinstance(full, dict):
@@ -239,7 +219,6 @@ class CanvasClient:
             if e.status_code != 404:
                 raise
 
-        # global
         try:
             full = self._request("GET", f"/api/v1/rubrics/{rid}")
             if isinstance(full, dict):
@@ -251,18 +230,7 @@ class CanvasClient:
         return None
 
     def get_rubric_for_assignment(self, course_id: int, assignment_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Return a rubric dict that includes criteria.
-
-        Strategy:
-          A) Try rubric_associations (some instances 404)
-          B) Fetch assignment include[]=rubric,rubric_settings,rubric_association and interpret:
-             - rubric is criteria list -> wrap {"criteria": list}
-             - rubric is rubric dict (maybe without criteria) -> fetch full by id
-             - rubric_settings has rubric_id -> fetch full by id
-        """
-
-        # A) rubric_associations endpoint (may 404)
+        # A) rubric_associations (may 404)
         try:
             assocs = self._request(
                 "GET",
@@ -282,14 +250,12 @@ class CanvasClient:
                 if isinstance(embedded, dict) and self._has_criteria(embedded):
                     return embedded
 
-                # If rubric object exists but lacks criteria, fetch by id
                 if isinstance(embedded, dict):
                     rid = embedded.get("id") or match.get("rubric_id")
                     full = self._fetch_rubric_by_id(course_id, rid)
                     if full and self._has_criteria(full):
                         return full
 
-                # Or rubric_id directly
                 full = self._fetch_rubric_by_id(course_id, match.get("rubric_id"))
                 if full and self._has_criteria(full):
                     return full
@@ -297,17 +263,14 @@ class CanvasClient:
         except CanvasAPIError as e:
             if e.status_code != 404:
                 raise
-            # else fall through
 
         # B) assignment include
         a = self.get_assignment(course_id, assignment_id, include=["rubric", "rubric_settings", "rubric_association"])
-
-        # Most important: criteria list case
         embedded = a.get("rubric")
+
         if self._looks_like_criteria_list(embedded):
             return {"criteria": embedded}
 
-        # Rubric dict case
         if isinstance(embedded, dict):
             if self._has_criteria(embedded):
                 return embedded
@@ -316,7 +279,6 @@ class CanvasClient:
             if full and self._has_criteria(full):
                 return full
 
-        # Sometimes rubric is a list with a single rubric dict summary
         if isinstance(embedded, list) and embedded and isinstance(embedded[0], dict):
             first = embedded[0]
             if self._has_criteria(first):
@@ -326,7 +288,6 @@ class CanvasClient:
             if full and self._has_criteria(full):
                 return full
 
-        # rubric_settings often contains the true rubric_id
         rs = a.get("rubric_settings") or {}
         if isinstance(rs, dict):
             rid = rs.get("rubric_id") or rs.get("id")
@@ -334,7 +295,6 @@ class CanvasClient:
             if full and self._has_criteria(full):
                 return full
 
-        # rubric_association may contain rubric_id
         ra = a.get("rubric_association") or {}
         if isinstance(ra, dict):
             rid = ra.get("rubric_id")
@@ -350,11 +310,6 @@ class CanvasClient:
         assignment_id: int,
         user_id: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """
-        Returns the submission dict for a text-entry submission.
-        If user_id is None, returns the first submission with non-empty body,
-        else returns the first submission.
-        """
         if user_id is not None:
             return self._request(
                 "GET",
