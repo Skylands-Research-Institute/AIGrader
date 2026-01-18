@@ -147,19 +147,10 @@ class CanvasClient:
     # -----------------------------
 
     def _find_course_folder_id_by_name(self, course_id: int, folder_name: str) -> int:
-        """
-        Find a course folder by name using the Canvas folders search_term filter.
-
-        Selection rule (to avoid surprises):
-          1) exact name match AND full_name endswith "/<folder_name>"
-          2) exact name match (if full_name missing)
-        Fail-fast if no matches.
-        """
         folder_name = folder_name.strip()
         if not folder_name:
             raise ValueError("folder_name must be non-empty.")
 
-        # Canvas: GET /api/v1/courses/:course_id/folders?search_term=...
         folders = self._get_paginated(
             f"/api/v1/courses/{course_id}/folders",
             params={"search_term": folder_name, "per_page": 100},
@@ -176,7 +167,6 @@ class CanvasClient:
         if not exact:
             raise FileNotFoundError(f'Canvas folder not found by name search_term="{folder_name}".')
 
-        # Prefer full_name that ends with "/<folder_name>"
         preferred: List[Dict[str, Any]] = []
         suffix = "/" + folder_name
         for f in exact:
@@ -184,15 +174,12 @@ class CanvasClient:
             if isinstance(full_name, str) and full_name.endswith(suffix):
                 preferred.append(f)
 
-        chosen = None
         if len(preferred) == 1:
             chosen = preferred[0]
         elif len(preferred) > 1:
-            # Multiple candidates; pick the shallowest (shortest full_name) to reduce ambiguity.
             preferred.sort(key=lambda x: len(str(x.get("full_name") or "")))
             chosen = preferred[0]
         else:
-            # No full_name help; pick the first exact match.
             chosen = exact[0]
 
         fid = chosen.get("id")
@@ -201,19 +188,6 @@ class CanvasClient:
         return int(fid)
 
     def get_course_file_text(self, course_id: int, folder_path: str, filename: str) -> str:
-        """
-        Load a text file from Canvas course Files, by folder name + filename.
-
-        We treat folder_path as a *folder name* (not a full nested path),
-        because Canvas folder path resolution is brittle across instances.
-
-        Example:
-          get_course_file_text(course_id, "AIGrader", "initial_prompt.txt")
-
-        Fail-fast behavior:
-          - raises FileNotFoundError if folder or file does not exist
-          - raises RuntimeError if download fails or content is empty
-        """
         folder_name = folder_path.strip().strip("/")
         want = filename.strip()
 
@@ -258,8 +232,18 @@ class CanvasClient:
         return text
 
     # -----------------------------
-    # Submission comment posting
+    # Submissions / comments
     # -----------------------------
+
+    def get_submission_with_comments(self, course_id: int, assignment_id: int, user_id: int) -> Dict[str, Any]:
+        """
+        Fetch a submission including submission_comments so we can detect existing AIGrader assessments.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}",
+            params={"include[]": ["submission_comments", "submission_history", "user"]},
+        )
 
     def add_submission_comment(
         self,
