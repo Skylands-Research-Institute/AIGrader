@@ -1,7 +1,19 @@
 # aigrader-test/driver.py
 #
 # Phase 3 test driver with full command-line arguments.
-# (Regenerated to remove run.rubric.criteria_map dependency.)
+# Updated: optional real LLM call via --use-llm (skips mock JSON).
+#
+# Usage (mock):
+#   python driver.py --course-id 16388 --assignment-id 364682 --user-id 28700 --base-url https://... --token ...
+#
+# Usage (real LLM):
+#   set OPENAI_API_KEY=...
+#   python driver.py --course-id 16388 --assignment-id 364682 --user-id 28700 --use-llm
+#
+# Notes:
+#  - --token may be omitted if CANVAS_TOKEN env var is set
+#  - --base-url may be omitted if CANVAS_BASE_URL env var is set
+#  - --openai-model may be omitted if OPENAI_MODEL env var is set (defaults in LLMClient)
 
 import argparse
 import json
@@ -21,9 +33,15 @@ from aigrader.grader import AIGrader
 from aigrader.prompt_builder import build_prompts
 from aigrader.score_parser import parse_and_validate
 
+# Only import OpenAI wrapper if needed
+try:
+    from aigrader.llm import LLMClient
+except Exception:
+    LLMClient = None  # type: ignore
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AIGrader Phase-3 test driver (no LLM call).")
+    p = argparse.ArgumentParser(description="AIGrader Phase-3 test driver (mock or real LLM).")
 
     p.add_argument(
         "--base-url",
@@ -48,6 +66,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print full system and user prompts (not truncated).",
     )
+
+    # --- LLM options ---
+    p.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="Call the real LLM (OpenAI) instead of using mocked JSON.",
+    )
+    p.add_argument(
+        "--openai-model",
+        default=None,
+        help="OpenAI model name (defaults to OPENAI_MODEL env var or LLMClient default).",
+    )
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature (optional). For grading, 0.0–0.3 is typical.",
+    )
+    p.add_argument(
+        "--reasoning-effort",
+        default=None,
+        help="Optional reasoning effort hint (e.g., low/medium/high) for supported models.",
+    )
+    p.add_argument(
+        "--save-raw",
+        default=None,
+        help="Optional path to save the raw model output text (useful for debugging).",
+    )
+
     return p.parse_args()
 
 
@@ -89,34 +136,62 @@ def main() -> int:
         print("\n=== USER PROMPT (preview) ===")
         print(spec.user_prompt[:1200] + ("...\n" if len(spec.user_prompt) > 1200 else ""))
 
-    # Build a local map {criterion_id: max_points} for printing and validation context
+    # Build a local map {criterion_id: max_points} for printing context
     max_points_by_id = {c.id: float(c.points) for c in run.rubric.criteria}
 
-    # 3) Mock model JSON (perfect-score example)
-    criteria_obj = {}
-    total = 0.0
-    for c in run.rubric.criteria:
-        criteria_obj[c.id] = {
-            "score": float(c.points),
-            "comment": f"Strong work on {c.description.lower()}; clear evidence throughout.",
+    # 3) Get model output (real or mock)
+    if args.use_llm:
+        if LLMClient is None:
+            raise RuntimeError(
+                "Could not import aigrader.llm.LLMClient. "
+                "Ensure the aigrader package is on PYTHONPATH and openai is installed."
+            )
+
+        llm = LLMClient(model=args.openai_model)  # api key read from OPENAI_API_KEY
+        print("\n=== CALLING LLM ===")
+        resp = llm.generate(
+            system_prompt=spec.system_prompt,
+            user_prompt=spec.user_prompt,
+            reasoning_effort=args.reasoning_effort,
+            temperature=args.temperature,
+        )
+
+        raw_text = resp.text
+        print(f"LLM response_id={resp.response_id} model={resp.model}")
+        if resp.usage:
+            print(f"LLM usage={resp.usage}")
+
+        if args.save_raw:
+            with open(args.save_raw, "w", encoding="utf-8") as f:
+                f.write(raw_text)
+            print(f"Saved raw model output to: {args.save_raw}")
+
+    else:
+        # Mock model JSON (perfect-score example)
+        criteria_obj = {}
+        total = 0.0
+        for c in run.rubric.criteria:
+            criteria_obj[c.id] = {
+                "score": float(c.points),
+                "comment": f"Strong work on {c.description.lower()}; clear evidence throughout.",
+            }
+            total += float(c.points)
+
+        mock_model_json = {
+            "overall_score": total,
+            "overall_comment": (
+                "This is a polished, engaging short story with a clear narrative arc, "
+                "effective use of symbolism, and a consistent voice. To improve further, "
+                "consider tightening a few longer sentences and adding one more concrete "
+                "sensory detail at the midpoint to heighten tension."
+            ),
+            "criteria": criteria_obj,
         }
-        total += float(c.points)
 
-    mock_model_json = {
-        "overall_score": total,
-        "overall_comment": (
-            "This is a polished, engaging short story with a clear narrative arc, "
-            "effective use of symbolism, and a consistent voice. To improve further, "
-            "consider tightening a few longer sentences and adding one more concrete "
-            "sensory detail at the midpoint to heighten tension."
-        ),
-        "criteria": criteria_obj,
-    }
-
-    mock_text = json.dumps(mock_model_json, indent=2, ensure_ascii=False)
+        raw_text = json.dumps(mock_model_json, indent=2, ensure_ascii=False)
 
     # 4) Parse + validate
-    result = parse_and_validate(mock_text, run)
+    result = parse_and_validate(raw_text, run)
 
     print("\n=== PARSED ASSESSMENT RESULT ===")
     print(f"Overall score: {result.overall_score:g}")

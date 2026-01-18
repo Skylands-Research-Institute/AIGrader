@@ -107,15 +107,15 @@ class AIGrader:
             course_id, assignment_id, user_id=user_id
         )
         if not submission:
-            raise SubmissionError("No submission found for this assignment (or user).")
+            raise SubmissionNotFoundError("No submission found for this assignment (or user).")
 
         submission_user_id = submission.get("user_id")
         if submission_user_id is None:
-            raise SubmissionError("Submission returned, but it did not include user_id.")
+            raise SubmissionNotFoundError("Submission returned, but it did not include user_id.")
 
         body_html = submission.get("body")
         if not isinstance(body_html, str) or not body_html.strip():
-            raise SubmissionError("Submission found, but no text-entry body was present.")
+            raise SubmissionNotFoundError("Submission found, but no text-entry body was present.")
 
         submission_text = html_to_text(body_html)
         submission_wc = word_count(submission_text)
