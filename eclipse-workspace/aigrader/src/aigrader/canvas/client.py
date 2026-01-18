@@ -58,17 +58,32 @@ class CanvasClient:
     def _url(self, path: str) -> str:
         return urljoin(self.auth.base_url + "/", path.lstrip("/"))
 
-    def _request(self, method: str, path: str, *, params: Dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Dict[str, Any] | None = None,
+        data: Dict[str, Any] | None = None,
+    ) -> Any:
         """
         Make a request with basic retry on transient 5xx.
         Returns parsed JSON.
         Raises CanvasAPIError on errors.
+
+        NOTE: `data` is optional form-encoded body (needed for PUT comment writeback).
         """
         url = self._url(path)
         last: Optional[CanvasAPIError] = None
 
         for attempt in range(1, self.max_retries + 1):
-            resp = self.session.request(method, url, params=params, timeout=self.timeout_s)
+            resp = self.session.request(
+                method,
+                url,
+                params=params,
+                data=data,
+                timeout=self.timeout_s,
+            )
 
             if resp.status_code < 400:
                 if resp.text.strip() == "":
@@ -191,6 +206,11 @@ class CanvasClient:
 
         Many Canvas installs return a rubric "summary" object without criteria; in that case
         we follow up by fetching /courses/:course_id/rubrics/:rubric_id.
+
+        IMPORTANT FIX:
+        - Some Canvas instances return assignment["rubric"] as a LIST OF CRITERIA.
+          That list is NOT a rubric object and its element IDs (e.g. "_2630") are criterion IDs,
+          not a rubric ID. In that case we should wrap and return it directly.
         """
 
         def has_criteria(r: Any) -> bool:
@@ -198,6 +218,15 @@ class CanvasClient:
                 return False
             c = r.get("criteria") or r.get("data")
             return isinstance(c, list) and len(c) > 0
+
+        def looks_like_criteria_list(x: Any) -> bool:
+            if not isinstance(x, list) or not x:
+                return False
+            first = x[0]
+            if not isinstance(first, dict):
+                return False
+            # Heuristic: criteria items have "points" and "description"
+            return ("points" in first) and (("description" in first) or ("criterion_description" in first))
 
         def fetch_full(rubric_id: Any) -> Optional[Dict[str, Any]]:
             if rubric_id is None:
@@ -271,9 +300,16 @@ class CanvasClient:
                 raise
 
         # Attempt B: assignment includes (common fallback)
-        a = self.get_assignment(course_id, assignment_id, include=["rubric", "rubric_association"])
+        a = self.get_assignment(course_id, assignment_id, include=["rubric", "rubric_association", "rubric_settings"])
 
         embedded = a.get("rubric")
+
+        # *** FIX: criteria-list case ***
+        if looks_like_criteria_list(embedded):
+            # AIGrader expects rubric_json["criteria"] or ["data"].
+            # Wrap this list so grader._extract_rubric_snapshot can read it.
+            return {"criteria": embedded}
+
         if isinstance(embedded, dict):
             if has_criteria(embedded):
                 return embedded
@@ -284,6 +320,7 @@ class CanvasClient:
 
         if isinstance(embedded, list) and embedded and isinstance(embedded[0], dict):
             first = embedded[0]
+            # If it isn't a criteria list (handled above), fall back to old behavior.
             if has_criteria(first):
                 return first
             rid = first.get("id")
