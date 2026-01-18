@@ -1,20 +1,10 @@
 # aigrader-test/driver.py
 #
-# Phase 3 test driver with full command-line arguments.
-# Updated: optional real LLM call via --use-llm (skips mock JSON).
-# Updated: optional posting of AI assessment as Canvas submission comment via --post-comment.
-#
-# Usage (mock):
-#   python driver.py --course-id 16388 --assignment-id 364682 --user-id 28700 --base-url https://... --token ... --post-comment
-#
-# Usage (real LLM):
-#   set OPENAI_API_KEY=...
-#   python driver.py --course-id 16388 --assignment-id 364682 --user-id 28700 --use-llm --post-comment
-#
-# Notes:
-#  - --token may be omitted if CANVAS_TOKEN env var is set
-#  - --base-url may be omitted if CANVAS_BASE_URL env var is set
-#  - --openai-model may be omitted if OPENAI_MODEL env var is set (defaults in LLMClient)
+# Test driver with full command-line arguments.
+# Supports:
+#  - mock or real LLM (--use-llm)
+#  - optional posting of assessment as Canvas submission comment (--post-comment)
+#  - optional HTML formatting for the comment (--comment-html)
 
 import argparse
 import json
@@ -29,7 +19,11 @@ AIGRADER_SRC = WORKSPACE / "aigrader" / "src"
 if AIGRADER_SRC.exists():
     sys.path.insert(0, str(AIGRADER_SRC))
 
-from aigrader.assessment_comment import CommentMetadata, render_ai_assessment_comment
+from aigrader.assessment_comment import (
+    CommentMetadata,
+    render_ai_assessment_comment,
+    render_ai_assessment_comment_html,
+)
 from aigrader.canvas.client import CanvasAuth, CanvasClient
 from aigrader.grader import AIGrader
 from aigrader.prompt_builder import build_prompts
@@ -43,7 +37,7 @@ except Exception:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="AIGrader Phase-3 test driver (mock or real LLM).")
+    p = argparse.ArgumentParser(description="AIGrader test driver (mock/LLM + optional Canvas comment).")
 
     p.add_argument(
         "--base-url",
@@ -97,11 +91,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional path to save the raw model output text (useful for debugging).",
     )
 
-    # --- Canvas writeback option (comment only) ---
+    # --- Posting options ---
     p.add_argument(
         "--post-comment",
         action="store_true",
-        help="Post the parsed assessment as a Canvas submission comment (review-only; does not apply grade/rubric).",
+        help="Post the generated assessment as a submission comment (Not Applied).",
+    )
+    p.add_argument(
+        "--comment-html",
+        action="store_true",
+        help="Render the comment using HTML formatting (headings/lists).",
     )
 
     return p.parse_args()
@@ -148,9 +147,9 @@ def main() -> int:
     # Build a local map {criterion_id: max_points} for printing context
     max_points_by_id = {c.id: float(c.points) for c in run.rubric.criteria}
 
-    meta: CommentMetadata | None = None
-
     # 3) Get model output (real or mock)
+    meta = CommentMetadata(model=None, response_id=None)
+
     if args.use_llm:
         if LLMClient is None:
             raise RuntimeError(
@@ -168,11 +167,11 @@ def main() -> int:
         )
 
         raw_text = resp.text
+        meta = CommentMetadata(model=resp.model, response_id=resp.response_id)
+
         print(f"LLM response_id={resp.response_id} model={resp.model}")
         if resp.usage:
             print(f"LLM usage={resp.usage}")
-
-        meta = CommentMetadata(model=resp.model, response_id=resp.response_id)
 
         if args.save_raw:
             with open(args.save_raw, "w", encoding="utf-8") as f:
@@ -216,17 +215,29 @@ def main() -> int:
         print(f"  - {cid}: {a.score:g} / {max_str}")
         print(f"    {a.comment}")
 
-    # 5) Optional: post as Canvas submission comment (review-only)
+    # 5) Optional: post comment to Canvas
     if args.post_comment:
-        comment_text = render_ai_assessment_comment(run, result, meta=meta)
-        client.add_submission_comment(
-            course_id=run.preflight.course_id,
-            assignment_id=run.preflight.assignment_id,
-            user_id=run.preflight.submission_user_id,
-            text_comment=comment_text,
-            as_html=False,
-        )
-        print("\nPosted AI assessment as a Canvas submission comment (Not Applied).")
+        if args.comment_html:
+            comment = render_ai_assessment_comment_html(run, result, meta=meta)
+            # Post the HTML fragment in comment[text_comment]; Canvas sanitizes/renders.
+            client.add_submission_comment(
+                course_id=args.course_id,
+                assignment_id=args.assignment_id,
+                user_id=run.preflight.submission_user_id,
+                text_comment=comment,
+                as_html=True,
+            )
+            print("\nPosted AI assessment as a Canvas HTML comment (Not Applied).")
+        else:
+            comment = render_ai_assessment_comment(run, result, meta=meta)
+            client.add_submission_comment(
+                course_id=args.course_id,
+                assignment_id=args.assignment_id,
+                user_id=run.preflight.submission_user_id,
+                text_comment=comment,
+                as_html=False,
+            )
+            print("\nPosted AI assessment as a Canvas text comment (Not Applied).")
 
     print("\nOK: End-to-end prompt + validation pipeline succeeded.")
     return 0
