@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--use-llm", action="store_true")
     p.add_argument("--openai-model", default=None)
+    p.add_argument("--openai-key", default=None)
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--reasoning-effort", default=None)
 
@@ -182,7 +183,7 @@ def main() -> int:
         if LLMClient is None:
             raise RuntimeError("Could not import aigrader.llm.LLMClient.")
 
-        llm = LLMClient(model=args.openai_model)
+        llm = LLMClient(api_key=args.openai_key, model=args.openai_model)
         print("\n=== CALLING LLM ===")
         resp = llm.generate(
             system_prompt=spec.system_prompt,
