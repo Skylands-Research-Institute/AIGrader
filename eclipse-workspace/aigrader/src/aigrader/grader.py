@@ -1,19 +1,22 @@
 # src/aigrader/grader.py
 #
 # Regenerated full file:
-# - Normalizes rubric long_description via html_to_text
+# - Supports Online Text Entry submissions (body HTML -> plain text)
+# - Supports DOCX file upload submissions (attachments -> download -> extract_docx -> plain text)
+# - Still normalizes rubric long_description via html_to_text
 # - Returns GradeRun with clean rubric guidance text
 #
-# Phase 2.6: Preflight + rubric snapshot (normalized) + submission snapshot.
+# Phase 2.7: Preflight + rubric snapshot (normalized) + submission snapshot (text-entry OR docx).
 # No OpenAI, no Canvas writeback.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .canvas import CanvasClient
 from .exceptions import AssignmentNotFoundError, RubricError, SubmissionNotFoundError
+from .extract_docx import extract_docx_text
 from .textutil import html_to_text, word_count
 
 
@@ -67,8 +70,8 @@ class AIGrader:
     Current phase:
       - Validates assignment exists
       - Validates rubric exists and has criteria
-      - Validates there is a text-entry submission (or finds one if user_id not provided)
-      - Normalizes submission HTML -> plain text
+      - Validates there is a submission (text-entry body OR supported .docx attachment)
+      - Normalizes submission into plain text
       - Normalizes rubric long_description HTML -> plain text
       - Returns a GradeRun (preflight + rubric snapshot + submission snapshot)
     """
@@ -94,7 +97,7 @@ class AIGrader:
         assignment_name = str(assignment.get("name") or f"Assignment {assignment_id}")
 
         # 2) Rubric (full JSON)
-        rubric_json = self.canvas_client.get_rubric_for_assignment(course_id, assignment_id)
+        rubric_json = self._get_rubric_for_assignment(course_id, assignment_id)
         if not rubric_json:
             raise RubricError("No rubric found attached to assignment.")
 
@@ -102,7 +105,7 @@ class AIGrader:
         if len(rubric_snapshot.criteria) == 0:
             raise RubricError("Rubric found, but it has no criteria.")
 
-        # 3) Submission (text entry)
+        # 3) Submission (text-entry OR docx upload)
         submission = self.canvas_client.get_submission_text_entry(
             course_id, assignment_id, user_id=user_id
         )
@@ -113,11 +116,7 @@ class AIGrader:
         if submission_user_id is None:
             raise SubmissionNotFoundError("Submission returned, but it did not include user_id.")
 
-        body_html = submission.get("body")
-        if not isinstance(body_html, str) or not body_html.strip():
-            raise SubmissionNotFoundError("Submission found, but no text-entry body was present.")
-
-        submission_text = html_to_text(body_html)
+        submission_text = self._extract_submission_text(submission)
         submission_wc = word_count(submission_text)
 
         # 4) Preflight summary
@@ -142,6 +141,114 @@ class AIGrader:
     # -----------------------------
     # Internal helpers
     # -----------------------------
+
+    def _get_rubric_for_assignment(self, course_id: int, assignment_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Maintain compatibility with older CanvasClient method names.
+        """
+        # Preferred (existing in your original codebase)
+        fn = getattr(self.canvas_client, "get_rubric_for_assignment", None)
+        if callable(fn):
+            data = fn(course_id, assignment_id)
+            return data if isinstance(data, dict) else None
+
+        # Alternate name (some refactors used this)
+        fn2 = getattr(self.canvas_client, "get_rubric", None)
+        if callable(fn2):
+            data = fn2(course_id, assignment_id)
+            return data if isinstance(data, dict) else None
+
+        raise RubricError("CanvasClient has no get_rubric_for_assignment() or get_rubric() method.")
+
+    def _extract_submission_text(self, submission: Dict[str, Any]) -> str:
+        """
+        Extract and normalize submission to plain text.
+        Priority:
+          1) Online text entry: submission["body"] (HTML)
+          2) DOCX attachment: first *.docx attachment in submission["attachments"]
+        """
+        # 1) Online text entry
+        body_html = submission.get("body")
+        if isinstance(body_html, str) and body_html.strip():
+            return html_to_text(body_html)
+
+        # 2) DOCX attachment upload
+        attachments = submission.get("attachments")
+        if isinstance(attachments, list):
+            att = self._pick_first_docx_attachment(attachments)
+            if att is not None:
+                docx_bytes = self._download_attachment_bytes(att)
+                result = extract_docx_text(docx_bytes, include_tables=True, include_headers_footers=False)
+                text = result.text.strip()
+                if not text:
+                    raise SubmissionNotFoundError("DOCX attachment was found, but extracted text was empty.")
+                return text
+
+        raise SubmissionNotFoundError(
+            "Submission found, but no online text-entry body or supported DOCX attachment was present."
+        )
+
+    def _pick_first_docx_attachment(self, attachments: List[Any]) -> Optional[Dict[str, Any]]:
+        """
+        Return the first attachment dict that appears to be a DOCX file.
+        """
+        for a in attachments:
+            if not isinstance(a, dict):
+                continue
+
+            filename = a.get("filename") or a.get("display_name") or ""
+            if isinstance(filename, str) and filename.lower().endswith(".docx"):
+                return a
+
+            # Some Canvas instances include content-type-like hints
+            ctype = a.get("content-type") or a.get("content_type") or ""
+            if isinstance(ctype, str) and "officedocument.wordprocessingml.document" in ctype.lower():
+                return a
+
+        return None
+
+    def _download_attachment_bytes(self, attachment: Dict[str, Any]) -> bytes:
+        """
+        Download attachment bytes via CanvasClient.
+        Compatible with either:
+          - CanvasClient.download_file_bytes(url)
+          - Falling back to CanvasClient.session.get(url)
+        """
+        # Canvas attachment objects commonly have "url"; some have "download_url"
+        url = attachment.get("url") or attachment.get("download_url")
+        if not isinstance(url, str) or not url.strip():
+            # Sometimes only an id is available, and you must fetch /files/:id
+            fid = attachment.get("id")
+            if fid is not None:
+                file_detail = getattr(self.canvas_client, "_request")(
+                    "GET",
+                    f"/api/v1/files/{fid}",
+                )
+                if isinstance(file_detail, dict):
+                    url = file_detail.get("url") or file_detail.get("download_url")
+
+        if not isinstance(url, str) or not url.strip():
+            raise SubmissionNotFoundError("DOCX attachment metadata did not include a usable download URL.")
+
+        # Prefer the helper if present (you added this in the updated client.py)
+        dl = getattr(self.canvas_client, "download_file_bytes", None)
+        if callable(dl):
+            return dl(url)
+
+        # Fallback: use session directly (older clients)
+        sess = getattr(self.canvas_client, "session", None)
+        timeout = getattr(self.canvas_client, "timeout_s", 30)
+        if sess is None:
+            raise SubmissionNotFoundError("CanvasClient cannot download attachment: no session present.")
+
+        resp = sess.get(url, timeout=timeout, allow_redirects=True)
+        if getattr(resp, "status_code", 500) >= 400:
+            raise SubmissionNotFoundError(f"Failed to download DOCX attachment (HTTP {resp.status_code}).")
+
+        data = resp.content
+        if not data:
+            raise SubmissionNotFoundError("Downloaded DOCX attachment was empty.")
+        return data
 
     def _extract_rubric_snapshot(self, rubric_json: Dict[str, Any]) -> RubricSnapshot:
         """
