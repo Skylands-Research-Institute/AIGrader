@@ -87,6 +87,10 @@ def _format_rubric(title: str, points_total: float, criteria: List[RubricCriteri
     lines.append(f"RUBRIC TOTAL POINTS: {points_total:g}")
     lines.append("")
     lines.append("RUBRIC CRITERIA (use these criterion IDs exactly):")
+    lines.append(
+        "IMPORTANT: Each criterion score must be between 0 and its Max Points. "
+        "Scores may not exceed the listed Max Points."
+        )
     lines.append("")
 
     for c in criteria:

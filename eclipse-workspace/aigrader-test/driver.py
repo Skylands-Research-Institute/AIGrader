@@ -100,12 +100,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _join_system_prompts(initial_prompt: str, assignment_prompt: str | None) -> str:
-    if assignment_prompt and assignment_prompt.strip():
-        return initial_prompt.strip() + "\n\n" + assignment_prompt.strip()
-    return initial_prompt.strip()
-
-
 def _truthy(v: object) -> bool:
     if v is None:
         return False
@@ -165,6 +159,74 @@ def iter_assignment_rows(path: str) -> list[dict]:
         return rows
 
 
+def _format_assignment_description_section(description: str) -> str:
+    desc = (description or "").strip()
+    if not desc:
+        return (
+            "=== ASSIGNMENT DESCRIPTION (Student-Facing Context) ===\n"
+            "Intent:\n"
+            "This section would reproduce the assignment description shown to students.\n"
+            "No assignment description was available for this assignment.\n"
+            "=== END ASSIGNMENT DESCRIPTION ==="
+        )
+
+    return (
+        "=== ASSIGNMENT DESCRIPTION (Student-Facing Context) ===\n"
+        "Intent:\n"
+        "This section reproduces the assignment description shown to students.\n"
+        "It is provided to help interpret student intent and task context.\n\n"
+        "Scope:\n"
+        "Contextual understanding only.\n\n"
+        "Limitations:\n"
+        "This section does not override the rubric or introduce additional grading criteria.\n"
+        "If there is any conflict, the rubric governs.\n\n"
+        f"{desc}\n"
+        "=== END ASSIGNMENT DESCRIPTION ==="
+    )
+
+
+def _get_assignment_description(client: CanvasClient, *, course_id: int, assignment_id: int) -> str:
+    """
+    Fetch the Canvas assignment.description (often HTML).
+    Tries a few client capabilities to avoid hard-coding CanvasClient internals.
+    """
+    # 1) Preferred: a strongly-named helper if it exists
+    for name in ("get_assignment", "get_assignment_json", "get_assignment_dict"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            try:
+                obj = fn(course_id=course_id, assignment_id=assignment_id)
+                if isinstance(obj, dict):
+                    d = obj.get("description") or ""
+                    return d if isinstance(d, str) else ""
+            except TypeError:
+                # signature mismatch; try next option
+                pass
+            except Exception:
+                # network/API issue; surface as empty (safe)
+                return ""
+
+    # 2) Fallback: use a lower-level request interface if exposed
+    for name in ("_request", "request", "get"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            try:
+                # Try common CanvasClient conventions.
+                # Canvas assignments endpoint includes description by default.
+                path = f"/api/v1/courses/{course_id}/assignments/{assignment_id}"
+                if name == "_request":
+                    obj = fn("GET", path)
+                else:
+                    obj = fn(path)
+                if isinstance(obj, dict):
+                    d = obj.get("description") or ""
+                    return d if isinstance(d, str) else ""
+            except Exception:
+                return ""
+
+    return ""
+
+
 def grade_one_assignment(
     *,
     args: argparse.Namespace,
@@ -185,32 +247,15 @@ def grade_one_assignment(
     print(run.preflight)
 
     # -----------------------------
-    # Load prompt files (system prompt)
+    # Load course prompt (system prompt persona)
     # -----------------------------
     initial_prompt = client.get_course_file_text(
         course_id=course_id,
         folder_path="AIGrader",
         filename="initial_prompt.txt",
     )
-
-    assignment_prompt_filename = f"assignment_{assignment_id}_prompt.txt"
-    assignment_prompt = None
-    try:
-        assignment_prompt = client.get_course_file_text(
-            course_id=course_id,
-            folder_path="AIGrader",
-            filename=assignment_prompt_filename,
-        )
-    except FileNotFoundError:
-        assignment_prompt = None
-
-    system_prompt = _join_system_prompts(initial_prompt, assignment_prompt)
-
-    if assignment_prompt is None:
-        print("\nSystem prompt source: AIGrader/initial_prompt.txt")
-        print(f"Assignment prompt: (none) AIGrader/{assignment_prompt_filename}")
-    else:
-        print("\nSystem prompt source: AIGrader/initial_prompt.txt + " f"AIGrader/{assignment_prompt_filename}")
+    print("\nSystem prompt source: AIGrader/initial_prompt.txt")
+    system_prompt_course = initial_prompt.strip()
 
     # -----------------------------
     # Idempotency: skip if already assessed for current submission state
@@ -222,25 +267,41 @@ def grade_one_assignment(
     )
     fp = compute_submission_fingerprint(sub)
 
-    if already_assessed(sub, fp):
+    already = already_assessed(sub, fp)
+    if already and not args.print_prompts:
         print("\nSKIP: Existing AIGrader assessment already posted for this submission (no resubmission detected).")
         print(f"{FINGERPRINT_PREFIX} {fp}")
         return 0
 
-    # Build prompts
-    spec = build_prompts(run, system_prompt=system_prompt)
+    # -----------------------------
+    # Fetch assignment description (student-facing)
+    # -----------------------------
+    assignment_description = _get_assignment_description(client, course_id=course_id, assignment_id=assignment_id)
+    assignment_desc_section = _format_assignment_description_section(assignment_description)
+
+    # Build prompts (rubric likely injected by prompt_builder)
+    spec = build_prompts(run, system_prompt=system_prompt_course)
+
+    # Enforce precedence: course prompt -> rubric (from build_prompts) -> assignment description
+    system_prompt_to_send = spec.system_prompt.rstrip() + "\n\n" + assignment_desc_section + "\n"
 
     if args.print_prompts:
         print("\n=== SYSTEM PROMPT ===")
-        print(spec.system_prompt)
+        print(system_prompt_to_send)
         print("\n=== USER PROMPT ===")
         print(spec.user_prompt)
     else:
         print("\n=== SYSTEM PROMPT (preview) ===")
-        print(spec.system_prompt[:800] + ("...\n" if len(spec.system_prompt) > 800 else ""))
+        preview = system_prompt_to_send[:800] + ("...\n" if len(system_prompt_to_send) > 800 else "")
+        print(preview)
         print("\n=== USER PROMPT (preview) ===")
         print(spec.user_prompt[:1200] + ("...\n" if len(spec.user_prompt) > 1200 else ""))
 
+    if already:
+        print("\nNOTE: Submission was already assessed; printed prompts only (no LLM call, no comment posted).")
+        print(f"{FINGERPRINT_PREFIX} {fp}")
+        return 0
+    
     meta = CommentMetadata(model=None, response_id=None)
 
     # Call LLM (or mock)
@@ -252,7 +313,7 @@ def grade_one_assignment(
         llm = LLMClient(api_key=args.openai_key, model=chosen_model)
         print("\n=== CALLING LLM ===")
         resp = llm.generate(
-            system_prompt=spec.system_prompt,
+            system_prompt=system_prompt_to_send,
             user_prompt=spec.user_prompt,
             reasoning_effort=args.reasoning_effort,
             temperature=args.temperature,
