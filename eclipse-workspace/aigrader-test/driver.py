@@ -89,13 +89,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--openai-model", default=None)
     p.add_argument("--openai-key", default=None)
     p.add_argument("--temperature", type=float, default=None)
-    p.add_argument("--reasoning-effort", default=None)
+    p.add_argument(
+        "--reasoning-effort",
+        default="low",
+        choices=["low", "medium", "high"],
+        )
 
     p.add_argument("--post-comment", action="store_true")
     p.add_argument("--comment-html", action="store_true")
 
     p.add_argument("--print-prompts", action="store_true")
     p.add_argument("--save-raw", default=None)
+    p.add_argument("--force", action="store_true", help="Grade even if an AIGrader comment fingerprint already exists.")
 
     return p.parse_args()
 
@@ -266,9 +271,9 @@ def grade_one_assignment(
         user_id=run.preflight.submission_user_id,
     )
     fp = compute_submission_fingerprint(sub)
-
+    
     already = already_assessed(sub, fp)
-    if already and not args.print_prompts:
+    if already and not args.force and not args.print_prompts:
         print("\nSKIP: Existing AIGrader assessment already posted for this submission (no resubmission detected).")
         print(f"{FINGERPRINT_PREFIX} {fp}")
         return 0
@@ -297,7 +302,7 @@ def grade_one_assignment(
         print("\n=== USER PROMPT (preview) ===")
         print(spec.user_prompt[:1200] + ("...\n" if len(spec.user_prompt) > 1200 else ""))
 
-    if already:
+    if already and not args.force:
         print("\nNOTE: Submission was already assessed; printed prompts only (no LLM call, no comment posted).")
         print(f"{FINGERPRINT_PREFIX} {fp}")
         return 0
