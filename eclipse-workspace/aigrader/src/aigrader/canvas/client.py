@@ -361,6 +361,31 @@ class CanvasClient:
         return data
 
 
+    def get_assignment_description(
+        self,
+        course_id: int,
+        assignment_id: int,
+    ) -> str:
+        """
+        Fetch the assignment description (often HTML).
+        
+        Args:
+            course_id: Canvas course ID
+            assignment_id: Canvas assignment ID
+            
+        Returns:
+            Assignment description as string (may be HTML), or empty string if not available
+        """
+        try:
+            assignment = self.get_assignment(course_id, assignment_id)
+            if isinstance(assignment, dict):
+                desc = assignment.get("description") or ""
+                return desc if isinstance(desc, str) else ""
+        except Exception:
+            # If we can't fetch it, return empty rather than failing
+            pass
+        return ""
+
     def add_submission_comment(
         self,
         course_id: int,
