@@ -1,17 +1,22 @@
 # src/aigrader/grader.py
 #
-# Regenerated full file:
-# - Supports Online Text Entry submissions (body HTML -> plain text)
-# - Supports DOCX file upload submissions (attachments -> download -> extract_docx -> plain text)
+# Full file (backward compatible) with revision analytics support:
+# - Still supports Online Text Entry (body HTML -> plain text)
+# - Still supports DOCX file upload submissions (attachments -> download -> extract_docx -> plain text)
 # - Still normalizes rubric long_description via html_to_text
-# - Returns GradeRun with clean rubric guidance text
+# - NEW (optional): captures previous attempt (if any) from submission_history
+# - NEW (optional): computes objective revision metrics + elapsed time since previous attempt
 #
-# Phase 2.7: Preflight + rubric snapshot (normalized) + submission snapshot (text-entry OR docx).
-# No OpenAI, no Canvas writeback.
+# Notes:
+# - All new GradeRun fields are OPTIONAL with defaults to preserve backward compatibility.
+# - No "AI detection" language; these are revision analytics only.
+# - Does not change any Canvas writeback; still returns a GradeRun snapshot.
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .canvas import CanvasClient
@@ -51,12 +56,41 @@ class RubricSnapshot:
     criteria: List[RubricCriterion]
 
 
+# -----------------------------
+# Revision analytics (objective)
+# -----------------------------
+
+@dataclass(frozen=True)
+class RevisionMetrics:
+    sentence_change_pct: float
+    word_overlap_pct: float
+    avg_sentence_length_before: float
+    avg_sentence_length_after: float
+    sentence_length_variance_before: float
+    sentence_length_variance_after: float
+    paragraph_count_before: int
+    paragraph_count_after: int
+
+
 @dataclass(frozen=True)
 class GradeRun:
     preflight: PreflightSummary
     rubric: RubricSnapshot
     submission_text: str
     submission_word_count: int
+
+    # --- NEW OPTIONAL FIELDS (backward compatible) ---
+    submission_attempt: Optional[int] = None
+    submitted_at: Optional[str] = None
+
+    previous_submission_text: Optional[str] = None
+    previous_submission_word_count: Optional[int] = None
+    previous_submission_attempt: Optional[int] = None
+    previous_submitted_at: Optional[str] = None
+
+    time_since_previous_attempt_seconds: Optional[int] = None
+    revision_metrics: Optional[RevisionMetrics] = None
+    revision_depth: Optional[str] = None  # "light" | "moderate" | "substantial"
 
 
 # -----------------------------
@@ -73,6 +107,8 @@ class AIGrader:
       - Validates there is a submission (text-entry body OR supported .docx attachment)
       - Normalizes submission into plain text
       - Normalizes rubric long_description HTML -> plain text
+      - (Optional) Extracts previous attempt from submission_history
+      - (Optional) Computes objective revision metrics + elapsed time between attempts
       - Returns a GradeRun (preflight + rubric snapshot + submission snapshot)
     """
 
@@ -119,6 +155,47 @@ class AIGrader:
         submission_text = self._extract_submission_text(submission)
         submission_wc = word_count(submission_text)
 
+        # --- NEW: attempt/timestamps + previous attempt extraction + metrics ---
+        submission_attempt = self._as_int_or_none(submission.get("attempt"))
+        submitted_at = self._as_str_or_none(submission.get("submitted_at")) or self._find_submitted_at_for_attempt(
+            submission, submission_attempt
+        )
+
+        prev_obj = self._pick_previous_attempt_obj(submission, submission_attempt)
+        previous_text: Optional[str] = None
+        previous_wc: Optional[int] = None
+        previous_attempt: Optional[int] = None
+        previous_submitted_at: Optional[str] = None
+        elapsed_seconds: Optional[int] = None
+        revision_metrics: Optional[RevisionMetrics] = None
+        revision_depth: Optional[str] = None
+
+        if prev_obj is not None:
+            previous_attempt = self._as_int_or_none(prev_obj.get("attempt"))
+            previous_submitted_at = self._as_str_or_none(prev_obj.get("submitted_at"))
+
+            # Extract previous text using the same logic (body HTML or DOCX attachment).
+            # Some Canvas instances include attachments in history items; if not, we fail gracefully.
+            try:
+                previous_text = self._extract_submission_text(prev_obj)
+                previous_wc = int(word_count(previous_text))
+            except Exception:
+                previous_text = None
+                previous_wc = None
+
+            # Compute elapsed time if timestamps exist
+            dt_curr = self._parse_canvas_datetime(submitted_at)
+            dt_prev = self._parse_canvas_datetime(previous_submitted_at)
+            if dt_curr is not None and dt_prev is not None:
+                delta = int((dt_curr - dt_prev).total_seconds())
+                if delta >= 0:
+                    elapsed_seconds = delta
+
+            # Compute revision metrics if both texts exist
+            if previous_text:
+                revision_metrics = self._compute_revision_metrics(previous_text, submission_text)
+                revision_depth = self._revision_depth_label(revision_metrics)
+
         # 4) Preflight summary
         preflight = PreflightSummary(
             course_id=int(course_id),
@@ -136,6 +213,18 @@ class AIGrader:
             rubric=rubric_snapshot,
             submission_text=submission_text,
             submission_word_count=int(submission_wc),
+
+            submission_attempt=submission_attempt,
+            submitted_at=submitted_at,
+
+            previous_submission_text=previous_text,
+            previous_submission_word_count=previous_wc,
+            previous_submission_attempt=previous_attempt,
+            previous_submitted_at=previous_submitted_at,
+
+            time_since_previous_attempt_seconds=elapsed_seconds,
+            revision_metrics=revision_metrics,
+            revision_depth=revision_depth,
         )
 
     # -----------------------------
@@ -318,3 +407,220 @@ class AIGrader:
             points_total=points_total_f,
             criteria=criteria,
         )
+
+    # -----------------------------
+    # Previous attempt selection + timestamps
+    # -----------------------------
+
+    def _pick_previous_attempt_obj(
+        self, submission: Dict[str, Any], current_attempt: Optional[int]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the history object with the largest attempt number < current_attempt.
+        Deterministic and robust to history ordering.
+
+        If current_attempt is None, we fall back to "second-best" attempt ordering if possible.
+        """
+        history = submission.get("submission_history")
+        if not isinstance(history, list) or len(history) < 2:
+            return None
+
+        # Collect attempt-bearing history entries
+        hist_entries: List[Dict[str, Any]] = [h for h in history if isinstance(h, dict)]
+        if not hist_entries:
+            return None
+
+        # If we know the current attempt number, choose max attempt < current
+        if current_attempt is not None:
+            candidates = []
+            for h in hist_entries:
+                a = self._as_int_or_none(h.get("attempt"))
+                if a is None:
+                    continue
+                if a < current_attempt:
+                    candidates.append((a, h))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda t: t[0])
+            return candidates[-1][1]
+
+        # Fallback: if attempt is missing, pick the most recent distinct entry
+        # (best-effort; avoids crashing)
+        # Try to sort by submitted_at
+        dated = []
+        for h in hist_entries:
+            ts = self._as_str_or_none(h.get("submitted_at"))
+            dt = self._parse_canvas_datetime(ts)
+            if dt is not None:
+                dated.append((dt, h))
+        if len(dated) >= 2:
+            dated.sort(key=lambda t: t[0])
+            return dated[-2][1]
+
+        # If we can't sort, best-effort: return a different object than the submission itself
+        # (history often includes the current attempt; return the first one that isn't same attempt)
+        return hist_entries[0] if hist_entries else None
+
+    def _find_submitted_at_for_attempt(
+        self, submission: Dict[str, Any], attempt: Optional[int]
+    ) -> Optional[str]:
+        """
+        If submission["submitted_at"] is missing, try to locate it in submission_history
+        for the matching attempt.
+        """
+        if attempt is None:
+            return None
+        history = submission.get("submission_history")
+        if not isinstance(history, list):
+            return None
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            a = self._as_int_or_none(h.get("attempt"))
+            if a == attempt:
+                return self._as_str_or_none(h.get("submitted_at"))
+        return None
+
+    # -----------------------------
+    # Revision metrics
+    # -----------------------------
+
+    _SENT_SPLIT_RE = re.compile(r"[.!?]+(?:\s+|$)")
+
+    def _compute_revision_metrics(self, previous_text: str, current_text: str) -> RevisionMetrics:
+        prev_sents = self._split_sentences(previous_text)
+        curr_sents = self._split_sentences(current_text)
+
+        # Sentence change percentage (simple exact-match after normalization)
+        sentence_change_pct = self._sentence_change_pct(prev_sents, curr_sents)
+
+        # Word overlap percentage (Jaccard similarity of normalized word sets)
+        word_overlap_pct = self._word_jaccard_pct(previous_text, current_text)
+
+        prev_lens = [len(self._tokenize_words(s)) for s in prev_sents] or [0]
+        curr_lens = [len(self._tokenize_words(s)) for s in curr_sents] or [0]
+
+        avg_before = sum(prev_lens) / max(1, len(prev_lens))
+        avg_after = sum(curr_lens) / max(1, len(curr_lens))
+
+        var_before = self._variance(prev_lens)
+        var_after = self._variance(curr_lens)
+
+        para_before = self._paragraph_count(previous_text)
+        para_after = self._paragraph_count(current_text)
+
+        return RevisionMetrics(
+            sentence_change_pct=float(sentence_change_pct),
+            word_overlap_pct=float(word_overlap_pct),
+            avg_sentence_length_before=float(avg_before),
+            avg_sentence_length_after=float(avg_after),
+            sentence_length_variance_before=float(var_before),
+            sentence_length_variance_after=float(var_after),
+            paragraph_count_before=int(para_before),
+            paragraph_count_after=int(para_after),
+        )
+
+    def _revision_depth_label(self, m: RevisionMetrics) -> str:
+        """
+        Simple, student-friendly label derived from sentence rewrite rate.
+        You can tune these thresholds later without breaking schema.
+        """
+        c = m.sentence_change_pct
+        if c >= 70.0:
+            return "substantial"
+        if c >= 35.0:
+            return "moderate"
+        return "light"
+
+    def _split_sentences(self, text: str) -> List[str]:
+        t = (text or "").strip()
+        if not t:
+            return []
+        parts = self._SENT_SPLIT_RE.split(t)
+        out = []
+        for p in parts:
+            p = p.strip()
+            if p:
+                out.append(p)
+        return out
+
+    def _norm_sentence(self, s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"[^\w\s']", "", s)  # keep apostrophes
+        return s.strip()
+
+    def _sentence_change_pct(self, prev_sents: List[str], curr_sents: List[str]) -> float:
+        if not prev_sents:
+            return 0.0
+        prev_norm = [self._norm_sentence(s) for s in prev_sents if s.strip()]
+        curr_set = {self._norm_sentence(s) for s in curr_sents if s.strip()}
+        if not prev_norm:
+            return 0.0
+        unchanged = sum(1 for s in prev_norm if s in curr_set)
+        changed = max(0, len(prev_norm) - unchanged)
+        return 100.0 * changed / max(1, len(prev_norm))
+
+    def _tokenize_words(self, text: str) -> List[str]:
+        # basic word tokenization; avoids punctuation artifacts
+        return re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+
+    def _word_jaccard_pct(self, a: str, b: str) -> float:
+        wa = set(self._tokenize_words(a))
+        wb = set(self._tokenize_words(b))
+        if not wa and not wb:
+            return 100.0
+        inter = len(wa & wb)
+        union = len(wa | wb)
+        if union <= 0:
+            return 0.0
+        return 100.0 * inter / union
+
+    def _variance(self, nums: List[int]) -> float:
+        if not nums:
+            return 0.0
+        mean = sum(nums) / len(nums)
+        return sum((x - mean) ** 2 for x in nums) / len(nums)
+
+    def _paragraph_count(self, text: str) -> int:
+        # Count non-empty paragraph blocks separated by blank lines
+        blocks = re.split(r"\n\s*\n+", (text or "").strip())
+        return sum(1 for b in blocks if b.strip())
+
+    # -----------------------------
+    # Timestamp parsing + small utils
+    # -----------------------------
+
+    def _parse_canvas_datetime(self, ts: Optional[str]) -> Optional[datetime]:
+        """
+        Parse Canvas ISO8601 timestamps like '2026-01-28T22:00:04Z'.
+        Returns timezone-aware UTC datetime when possible.
+        """
+        if not ts or not isinstance(ts, str):
+            return None
+        s = ts.strip()
+        if not s:
+            return None
+        try:
+            # Common Canvas format ends with 'Z'
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _as_int_or_none(self, v: Any) -> Optional[int]:
+        try:
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            return None
+
+    def _as_str_or_none(self, v: Any) -> Optional[str]:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        return None
