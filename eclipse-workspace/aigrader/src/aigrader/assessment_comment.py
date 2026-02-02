@@ -6,6 +6,11 @@
 #   both the plain-text and HTML renderers will include a "Revision Report (Informational)"
 #   block just before the instructor note.
 # - If those fields are absent, renderers behave exactly as before.
+#
+# 2026-02-02 changes:
+# - Add "Overall score change: ..." as the FIRST line item under Revision Report,
+#   when run.previous_overall_score is available and current overall score is known.
+# - Ensure the Revision Report prints the "Note:" line exactly once and at the end.
 
 from __future__ import annotations
 
@@ -120,15 +125,22 @@ def _format_elapsed(seconds: Optional[int]) -> Optional[str]:
     return f"{hours} hour{'s' if hours != 1 else ''} {rem_mins} minute{'s' if rem_mins != 1 else ''}"
 
 
-def _render_revision_report_text(run) -> list[str]:
+def _render_revision_report_text(run, *, curr_overall_score: Optional[float] = None) -> list[str]:
     """
     Returns lines for a student+instructor-visible "Revision Report (Informational)".
     Only rendered if at least one revision signal is available.
+
+    If run.previous_overall_score exists and curr_overall_score is provided,
+    we add "Overall score change: ..." as the first line item under the heading.
     """
     prev_attempt = _as_int(getattr(run, "previous_submission_attempt", None))
     curr_attempt = _as_int(getattr(run, "submission_attempt", None))
     elapsed_s = _as_int(getattr(run, "time_since_previous_attempt_seconds", None))
     depth = _as_str(getattr(run, "revision_depth", None))
+
+    # NEW: overall score delta (requires prior score stored on run + current score passed in)
+    prev_overall = _as_float(getattr(run, "previous_overall_score", None))
+    curr_overall = _as_float(curr_overall_score)
 
     metrics = getattr(run, "revision_metrics", None)
     sentence_change = _as_float(getattr(metrics, "sentence_change_pct", None)) if metrics else None
@@ -141,7 +153,20 @@ def _render_revision_report_text(run) -> list[str]:
     # Determine if there's anything to show
     has_any = any(
         x is not None
-        for x in [prev_attempt, curr_attempt, elapsed_s, depth, sentence_change, word_overlap, var_before, var_after, para_before, para_after]
+        for x in [
+            prev_overall,
+            curr_overall,
+            prev_attempt,
+            curr_attempt,
+            elapsed_s,
+            depth,
+            sentence_change,
+            word_overlap,
+            var_before,
+            var_after,
+            para_before,
+            para_after,
+        ]
     )
     if not has_any:
         return []
@@ -150,9 +175,15 @@ def _render_revision_report_text(run) -> list[str]:
     lines.append("")
     lines.append("Revision Report (Informational)")
 
+    # FIRST line item: score change (if available)
+    if prev_overall is not None and curr_overall is not None:
+        delta = curr_overall - prev_overall
+        sign = "+" if delta > 0 else ""
+        lines.append(f"Overall score change: {sign}{delta:g} points ({prev_overall:g} \u2192 {curr_overall:g})")
+
     # Attempt context (optional)
     if prev_attempt is not None and curr_attempt is not None:
-        lines.append(f"Attempts compared: {prev_attempt} → {curr_attempt}")
+        lines.append(f"Attempts compared: {prev_attempt} \u2192 {curr_attempt}")
     elif curr_attempt is not None:
         lines.append(f"Attempt: {curr_attempt}")
 
@@ -163,7 +194,6 @@ def _render_revision_report_text(run) -> list[str]:
 
     # Depth label (if computed)
     if depth:
-        # normalize capitalization for display
         lines.append(f"Revision depth: {depth.capitalize()}")
 
     # What changed between drafts (metrics translated)
@@ -181,7 +211,7 @@ def _render_revision_report_text(run) -> list[str]:
         if para_before == para_after:
             bullets.append("Paragraph structure remained stable; revisions focused on content within paragraphs.")
         else:
-            bullets.append(f"Paragraph structure changed ({para_before} → {para_after}), indicating reorganization.")
+            bullets.append(f"Paragraph structure changed ({para_before} \u2192 {para_after}), indicating reorganization.")
 
     if bullets:
         lines.append("")
@@ -189,6 +219,7 @@ def _render_revision_report_text(run) -> list[str]:
         for b in bullets[:5]:
             lines.append(f"- {b}")
 
+    # Note MUST be last and MUST appear once
     lines.append("")
     lines.append(
         "Note: This report describes observable patterns between draft versions. "
@@ -197,15 +228,14 @@ def _render_revision_report_text(run) -> list[str]:
     return lines
 
 
-def _render_revision_report_html(run) -> str:
+def _render_revision_report_html(run, *, curr_overall_score: Optional[float] = None) -> str:
     """
     HTML block for the same report. Returns "" if nothing to show.
     """
-    lines = _render_revision_report_text(run)
+    lines = _render_revision_report_text(run, curr_overall_score=curr_overall_score)
     if not lines:
         return ""
-    # Convert the plain-text block to simple HTML. Preserve headings and bullet points.
-    # We intentionally keep this very Canvas-safe (p, br, b, ul, li, em).
+
     heading = "Revision Report (Informational)"
     bullets: list[str] = []
     body_lines: list[str] = []
@@ -227,10 +257,19 @@ def _render_revision_report_html(run) -> str:
         if line.strip():
             body_lines.append(line.strip())
 
+    # Extract Note: (ensure it appears once)
+    note_line = ""
+    for line in reversed(lines):
+        if line.strip().startswith("Note:"):
+            note_line = line.strip()
+            break
+
     html: list[str] = []
     html.append("<p><b>Revision Report (Informational)</b><br>")
-    # Body lines (attempts, timing, depth)
     for bl in body_lines:
+        # The note is rendered separately as <em> below
+        if bl.startswith("Note:"):
+            continue
         html.append(f"{_esc(bl)}<br>")
     html.append("</p>")
 
@@ -241,20 +280,13 @@ def _render_revision_report_html(run) -> str:
             html.append(f"<li>{_esc(b)}</li>")
         html.append("</ul>")
 
-    # Note (last line in text version starts with "Note:")
-    # We locate it from original lines to keep exact wording.
-    note_line = ""
-    for line in reversed(lines):
-        if line.strip().startswith("Note:"):
-            note_line = line.strip()
-            break
     if note_line:
         html.append(f"<p><em>{_esc(note_line)}</em></p>")
 
     return "".join(html)
 
 
-def render_ai_assessment_comment(run, result, meta: Optional[CommentMetadata] = None) -> str:
+def render_ai_assessment_comment(run, result, meta: Optional["CommentMetadata"] = None) -> str:
     """
     Plain text renderer.
     """
@@ -285,7 +317,8 @@ def render_ai_assessment_comment(run, result, meta: Optional[CommentMetadata] = 
     parts.append(f"Submission: user_id={submission_user_id} ({submission_word_count} words)")
     parts.append("")
 
-    parts.append(f"Suggested Overall Score: {float(getattr(result, 'overall_score', 0.0)):g} / {total:g}")
+    overall_score = float(getattr(result, "overall_score", 0.0))
+    parts.append(f"Suggested Overall Score: {overall_score:g} / {total:g}")
     parts.append("Suggested Overall Comment:")
     parts.append(str(getattr(result, "overall_comment", "")).strip())
     parts.append("")
@@ -313,13 +346,13 @@ def render_ai_assessment_comment(run, result, meta: Optional[CommentMetadata] = 
         parts.append("")
 
     # NEW: Revision Report (Informational) — student + instructor visible
-    parts.extend(_render_revision_report_text(run))
+    parts.extend(_render_revision_report_text(run, curr_overall_score=overall_score))
 
     parts.append("Instructor note: This is an AI-generated suggestion only. Please review before assigning any points/grade.")
     return "\n".join(parts).strip()
 
 
-def render_ai_assessment_comment_html(run, result, meta: Optional[CommentMetadata] = None) -> str:
+def render_ai_assessment_comment_html(run, result, meta: Optional["CommentMetadata"] = None) -> str:
     """
     HTML renderer for Canvas.
     Uses only tags Canvas tends to keep: p, br, b, em, ul, li.
@@ -390,7 +423,7 @@ def render_ai_assessment_comment_html(run, result, meta: Optional[CommentMetadat
     html.append("</ul>")
 
     # NEW: Revision Report (Informational) — student + instructor visible
-    rev_html = _render_revision_report_html(run)
+    rev_html = _render_revision_report_html(run, curr_overall_score=overall_score)
     if rev_html:
         html.append(rev_html)
 

@@ -11,6 +11,10 @@
 # - All new GradeRun fields are OPTIONAL with defaults to preserve backward compatibility.
 # - No "AI detection" language; these are revision analytics only.
 # - Does not change any Canvas writeback; still returns a GradeRun snapshot.
+#
+# 2026-02-02 change:
+# - Adds GradeRun.previous_overall_score by parsing prior AIGrader submission_comments.
+#   This enables "Overall score change: ..." as the first line item in the Revision Report.
 
 from __future__ import annotations
 
@@ -88,6 +92,9 @@ class GradeRun:
     previous_submission_attempt: Optional[int] = None
     previous_submitted_at: Optional[str] = None
 
+    # Previous AIGrader overall score (from prior assessment comment), if available
+    previous_overall_score: Optional[float] = None
+
     time_since_previous_attempt_seconds: Optional[int] = None
     revision_metrics: Optional[RevisionMetrics] = None
     revision_depth: Optional[str] = None  # "light" | "moderate" | "substantial"
@@ -109,6 +116,7 @@ class AIGrader:
       - Normalizes rubric long_description HTML -> plain text
       - (Optional) Extracts previous attempt from submission_history
       - (Optional) Computes objective revision metrics + elapsed time between attempts
+      - (Optional) Extracts previous overall score from prior AIGrader comments
       - Returns a GradeRun (preflight + rubric snapshot + submission snapshot)
     """
 
@@ -142,6 +150,11 @@ class AIGrader:
             raise RubricError("Rubric found, but it has no criteria.")
 
         # 3) Submission (text-entry OR docx upload)
+        #
+        # We do a 2-step fetch for best compatibility:
+        #   - First, locate a submission (optionally without specifying a user_id).
+        #   - Then, once we know the user_id, fetch the full submission including
+        #     submission_comments (needed for previous overall score), history, and attachments.
         submission = self.canvas_client.get_submission_text_entry(
             course_id, assignment_id, user_id=user_id
         )
@@ -151,6 +164,16 @@ class AIGrader:
         submission_user_id = submission.get("user_id")
         if submission_user_id is None:
             raise SubmissionNotFoundError("Submission returned, but it did not include user_id.")
+
+        # Prefer the richer submission payload (includes submission_comments)
+        get_with_comments = getattr(self.canvas_client, "get_submission_with_comments", None)
+        if callable(get_with_comments):
+            try:
+                submission = get_with_comments(course_id, assignment_id, int(submission_user_id))
+            except Exception:
+                # Fall back to the basic submission object if the endpoint is unavailable
+                # in this Canvas deployment.
+                pass
 
         submission_text = self._extract_submission_text(submission)
         submission_wc = word_count(submission_text)
@@ -162,6 +185,12 @@ class AIGrader:
         )
 
         prev_obj = self._pick_previous_attempt_obj(submission, submission_attempt)
+        # Extract the previous AIGrader overall score (if any) from prior submission comments.
+        # This enables the assessment_comment renderer to show an overall score delta in the Revision Report.
+        previous_overall_score = self._extract_previous_overall_score_from_comments(
+            submission.get("submission_comments"), current_attempt=submission_attempt
+        )
+
         previous_text: Optional[str] = None
         previous_wc: Optional[int] = None
         previous_attempt: Optional[int] = None
@@ -221,6 +250,7 @@ class AIGrader:
             previous_submission_word_count=previous_wc,
             previous_submission_attempt=previous_attempt,
             previous_submitted_at=previous_submitted_at,
+            previous_overall_score=previous_overall_score,
 
             time_since_previous_attempt_seconds=elapsed_seconds,
             revision_metrics=revision_metrics,
@@ -482,6 +512,93 @@ class AIGrader:
         return None
 
     # -----------------------------
+    # Previous overall score (from prior AIGrader comment)
+    # -----------------------------
+
+    _SUGGESTED_OVERALL_SCORE_RE = re.compile(
+        r"Suggested\s+Overall\s+Score\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+        re.IGNORECASE,
+    )
+
+    def _extract_previous_overall_score_from_comments(
+        self,
+        submission_comments: Any,
+        *,
+        current_attempt: Optional[int],
+    ) -> Optional[float]:
+        """
+        Attempt to recover the previous AIGrader "Suggested Overall Score" from Canvas submission_comments.
+
+        We do this because Canvas submission_history does NOT include prior rubric assessments,
+        but prior AIGrader comments typically contain a line like:
+            Suggested Overall Score: 88 / 100
+
+        We parse the most recent matching comment (best-effort). Returns None if unavailable.
+        """
+        if not isinstance(submission_comments, list) or not submission_comments:
+            return None
+
+        # Canvas comment objects typically include:
+        #   - "comment" (HTML string)
+        #   - "created_at" (timestamp)
+        # We sort newest-first and return the first parseable score.
+        def _created_at_key(c: Any) -> str:
+            if not isinstance(c, dict):
+                return ""
+            v = c.get("created_at") or c.get("posted_at") or ""
+            return str(v)
+
+        comments_sorted = sorted(
+            [c for c in submission_comments if isinstance(c, dict)],
+            key=_created_at_key,
+            reverse=True,
+        )
+
+        for c in comments_sorted:
+            raw = c.get("comment")
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+
+            # Heuristic: only consider comments that look like they came from AIGrader.
+            # (We keep this permissive to avoid missing slightly edited comments.)
+            if "AI Assessment" not in raw and "aigrader_fingerprint" not in raw and "Suggested Overall Score" not in raw:
+                continue
+
+            # Strip HTML tags to improve regex hit rate, but keep plain text too.
+            # html_to_text is already in this module and handles Canvas-safe HTML.
+            try:
+                plain = html_to_text(raw)
+            except Exception:
+                plain = raw
+
+            # Parse score from either plain or raw.
+            score = self._parse_suggested_overall_score(plain) or self._parse_suggested_overall_score(raw)
+            if score is None:
+                continue
+
+            # Best-effort: if the comment appears to be for the *current* attempt, skip it.
+            # In practice, during a grading run, the current attempt's comment hasn't been posted yet,
+            # but this protects re-runs / edge cases.
+            if current_attempt is not None:
+                if f"attempt={current_attempt}|" in plain or f"attempt={current_attempt}|" in raw:
+                    continue
+
+            return score
+
+        return None
+
+    def _parse_suggested_overall_score(self, s: str) -> Optional[float]:
+        if not isinstance(s, str) or not s.strip():
+            return None
+        m = self._SUGGESTED_OVERALL_SCORE_RE.search(s)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    # -----------------------------
     # Revision metrics
     # -----------------------------
 
@@ -522,95 +639,90 @@ class AIGrader:
 
     def _revision_depth_label(self, m: RevisionMetrics) -> str:
         """
-        Simple, student-friendly label derived from sentence rewrite rate.
-        You can tune these thresholds later without breaking schema.
+        Map objective revision signals to a simple descriptive label.
+        Conservative thresholds; easy for instructors/students to interpret.
         """
-        c = m.sentence_change_pct
-        if c >= 70.0:
+        # sentence_change_pct: higher means more rewriting.
+        # word_overlap_pct: higher means more reuse.
+        sc = float(m.sentence_change_pct)
+        wo = float(m.word_overlap_pct)
+
+        # Substantial: most sentences changed OR overlap is low (big rewrite)
+        if sc >= 70.0 or wo <= 65.0:
             return "substantial"
-        if c >= 35.0:
+
+        # Moderate: meaningful but not wholesale rewrite
+        if sc >= 35.0 or wo <= 85.0:
             return "moderate"
+
         return "light"
 
     def _split_sentences(self, text: str) -> List[str]:
-        t = (text or "").strip()
-        if not t:
-            return []
-        parts = self._SENT_SPLIT_RE.split(t)
-        out = []
-        for p in parts:
-            p = p.strip()
-            if p:
-                out.append(p)
-        return out
-
-    def _norm_sentence(self, s: str) -> str:
-        s = s.lower().strip()
-        s = re.sub(r"\s+", " ", s)
-        s = re.sub(r"[^\w\s']", "", s)  # keep apostrophes
-        return s.strip()
+        cleaned = self._normalize_text(text)
+        parts = [p.strip() for p in self._SENT_SPLIT_RE.split(cleaned) if p.strip()]
+        return parts
 
     def _sentence_change_pct(self, prev_sents: List[str], curr_sents: List[str]) -> float:
         if not prev_sents:
-            return 0.0
-        prev_norm = [self._norm_sentence(s) for s in prev_sents if s.strip()]
-        curr_set = {self._norm_sentence(s) for s in curr_sents if s.strip()}
-        if not prev_norm:
-            return 0.0
-        unchanged = sum(1 for s in prev_norm if s in curr_set)
-        changed = max(0, len(prev_norm) - unchanged)
-        return 100.0 * changed / max(1, len(prev_norm))
+            return 100.0 if curr_sents else 0.0
+        prev_set = set(self._normalize_sentence(s) for s in prev_sents if s.strip())
+        curr_set = set(self._normalize_sentence(s) for s in curr_sents if s.strip())
 
-    def _tokenize_words(self, text: str) -> List[str]:
-        # basic word tokenization; avoids punctuation artifacts
-        return re.findall(r"[A-Za-z0-9']+", (text or "").lower())
+        if not prev_set:
+            return 100.0 if curr_set else 0.0
+
+        unchanged = len(prev_set.intersection(curr_set))
+        changed = max(0, len(curr_set) - unchanged)
+
+        # Define change relative to current size; avoids punishing added sentences too harshly
+        denom = max(1, len(curr_set))
+        return 100.0 * (changed / denom)
 
     def _word_jaccard_pct(self, a: str, b: str) -> float:
         wa = set(self._tokenize_words(a))
         wb = set(self._tokenize_words(b))
         if not wa and not wb:
             return 100.0
-        inter = len(wa & wb)
-        union = len(wa | wb)
-        if union <= 0:
-            return 0.0
-        return 100.0 * inter / union
+        inter = len(wa.intersection(wb))
+        union = len(wa.union(wb)) or 1
+        return 100.0 * (inter / union)
+
+    def _tokenize_words(self, text: str) -> List[str]:
+        t = self._normalize_text(text)
+        # Keep simple alphanumerics; collapse apostrophes
+        t = re.sub(r"[^a-z0-9'\s]+", " ", t)
+        t = t.replace("'", "")
+        words = [w for w in t.split() if w]
+        return words
 
     def _variance(self, nums: List[int]) -> float:
         if not nums:
             return 0.0
-        mean = sum(nums) / len(nums)
-        return sum((x - mean) ** 2 for x in nums) / len(nums)
+        mean = sum(nums) / max(1, len(nums))
+        return sum((x - mean) ** 2 for x in nums) / max(1, len(nums))
 
     def _paragraph_count(self, text: str) -> int:
-        # Count non-empty paragraph blocks separated by blank lines
-        blocks = re.split(r"\n\s*\n+", (text or "").strip())
-        return sum(1 for b in blocks if b.strip())
-
-    # -----------------------------
-    # Timestamp parsing + small utils
-    # -----------------------------
-
-    def _parse_canvas_datetime(self, ts: Optional[str]) -> Optional[datetime]:
-        """
-        Parse Canvas ISO8601 timestamps like '2026-01-28T22:00:04Z'.
-        Returns timezone-aware UTC datetime when possible.
-        """
-        if not ts or not isinstance(ts, str):
-            return None
-        s = ts.strip()
+        s = (text or "").replace("\r\n", "\n").strip()
         if not s:
-            return None
-        try:
-            # Common Canvas format ends with 'Z'
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            return None
+            return 0
+        paras = [p for p in re.split(r"\n\s*\n+", s) if p.strip()]
+        return max(1, len(paras))
+
+    def _normalize_text(self, text: str) -> str:
+        s = (text or "").lower()
+        s = s.replace("\r\n", "\n")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def _normalize_sentence(self, s: str) -> str:
+        t = self._normalize_text(s)
+        t = re.sub(r"[^a-z0-9\s]+", "", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    # -----------------------------
+    # Basic parsing helpers
+    # -----------------------------
 
     def _as_int_or_none(self, v: Any) -> Optional[int]:
         try:
@@ -624,3 +736,23 @@ class AIGrader:
         if isinstance(v, str) and v.strip():
             return v.strip()
         return None
+
+    def _parse_canvas_datetime(self, s: Optional[str]) -> Optional[datetime]:
+        """
+        Parse Canvas ISO timestamps (typically UTC with Z), return aware datetime in UTC.
+        """
+        if not s or not isinstance(s, str):
+            return None
+        try:
+            # Examples:
+            # 2026-01-31T18:19:07Z
+            # 2026-01-31T18:19:07+00:00
+            ss = s.strip()
+            if ss.endswith("Z"):
+                ss = ss[:-1] + "+00:00"
+            dt = datetime.fromisoformat(ss)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
