@@ -403,3 +403,9 @@ class CanvasClient:
             payload["comment[attempt]"] = int(attempt)
     
         return self._request("PUT", path, data=payload)
+
+    def list_submissions(self, course_id, assignment_id):
+        return self._get_paginated(
+            f"/api/v1/courses/{course_id}/assignments/{assignment_id}/submissions",
+            params={"include[]": ["submission_history", "user", "attachments"], "per_page": 100},
+            )
