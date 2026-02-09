@@ -268,9 +268,7 @@ def _grade_one_submission(
         print(system_prompt_to_send)
         print("\n=== USER PROMPT ===")
         print(spec.user_prompt)
-        print(f"\nNOTE: Already assessed check = {already}; not grading in --print-prompts mode.")
-        print(f"Fingerprint: {fp}")
-        return 0
+        print("NOTE: --print-prompts enabled (printing prompts, continuing with assessment).")
     else:
         print("\n=== SYSTEM PROMPT (preview) ===")
         preview = system_prompt_to_send[:800]
