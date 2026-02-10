@@ -28,6 +28,5 @@ aigrader \
   --post-comment \
   --comment-html \
   --token "$CANVAS_TOKEN" \
-  --base-url "$CANVAS_BASE_URL" \
-  --print-prompts
+  --base-url "$CANVAS_BASE_URL"
 
