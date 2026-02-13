@@ -4,6 +4,12 @@ from __future__ import annotations
 
 TECHNICAL_SYSTEM_PROMPT = """You must follow the rubric exactly and assign points per criterion within the allowed range.
 
+Do not assume the genre or course. Grade whatever is provided using the rubric and the assignment name/context.
+
+Treat assignment-specific prompt as optional guidance; rubric is the authority.
+
+Do not assume this is a short story or any specific genre unless the assignment-specific prompt says so. Use the rubric and assignment name as the context.
+
 Output rules (critical):
 1) Output ONLY valid JSON. No markdown. No extra commentary. No trailing commas.
 2) The JSON must match the provided schema exactly: keys, nesting, and types.
