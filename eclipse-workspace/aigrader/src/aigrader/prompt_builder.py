@@ -32,14 +32,16 @@ def build_prompts(run: GradeRun, *, system_prompt: str) -> PromptSpec:
     Build the system and user prompts for rubric-aligned assessment.
 
     IMPORTANT:
-      - `system_prompt` must be provided by the caller (e.g., loaded from Canvas Files).
+      - `system_prompt` must be provided by the caller (e.g., instructor prompt from Canvas
+        combined with technical instructions from the codebase).
       - There is no embedded default system prompt in this module.
     """
     if system_prompt is None or not str(system_prompt).strip():
         raise RuntimeError(
             "System prompt is missing/empty. "
-            "Expected caller to load it (e.g., Canvas file AIGrader/initial_prompt.txt) "
-            "and pass build_prompts(..., system_prompt=...)."
+            "Expected caller to provide a non-empty combined system prompt "
+            "(instructor + technical instructions) and pass "
+            "build_prompts(..., system_prompt=...)."
         )
 
     rubric_block = _format_rubric(run.rubric.title, run.rubric.points_total, run.rubric.criteria)
