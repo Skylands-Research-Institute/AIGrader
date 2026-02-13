@@ -42,6 +42,7 @@ if __name__ == "__main__" and __package__ is None:
     )
     from aigrader.prompt_builder import build_prompts
     from aigrader.score_parser import parse_and_validate
+    from aigrader.technical_prompt import combine_system_prompts
 
     try:
         from aigrader.llm import LLMClient
@@ -65,6 +66,7 @@ else:
     )
     from ..prompt_builder import build_prompts
     from ..score_parser import parse_and_validate
+    from ..technical_prompt import combine_system_prompts
 
     try:
         from ..llm import LLMClient
@@ -222,15 +224,16 @@ def _grade_one_submission(
     print(f"Submission: {run.preflight.submission_word_count} words")
 
     # -----------------------------
-    # Fetch system prompt from Canvas
+    # Fetch instructor prompt from Canvas
     # -----------------------------
-    initial_prompt = client.get_course_file_text(
+    instructor_prompt = client.get_course_file_text(
         course_id=course_id,
         folder_path="AIGrader",
         filename="initial_prompt.txt",
     )
-    print("System prompt source: AIGrader/initial_prompt.txt")
-    system_prompt_course = initial_prompt.strip()
+    print("Instructor prompt source: AIGrader/initial_prompt.txt")
+    system_prompt = combine_system_prompts(instructor_prompt)
+    print("Technical prompt source: aigrader/technical_prompt.py")
 
     # -----------------------------
     # Idempotency check
@@ -257,7 +260,7 @@ def _grade_one_submission(
     # -----------------------------
     # Build prompts
     # -----------------------------
-    spec = build_prompts(run, system_prompt=system_prompt_course)
+    spec = build_prompts(run, system_prompt=system_prompt)
 
     # Combine: system prompt + assignment description
     system_prompt_to_send = spec.system_prompt.rstrip() + "\n\n" + assignment_desc_section + "\n"
